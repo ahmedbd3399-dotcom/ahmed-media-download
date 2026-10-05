@@ -4,7 +4,6 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from dotenv import load_dotenv
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,8 +14,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-load_dotenv()
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -34,6 +31,7 @@ def download_media(url, media_type, quality):
 
         if media_type == "audio":
             bitrate = quality.replace("mp3_", "")
+
             options = {
                 "format": "bestaudio/best",
                 "outtmpl": output,
@@ -47,6 +45,7 @@ def download_media(url, media_type, quality):
                     }
                 ],
             }
+
         else:
             height = quality.replace("p", "")
 
@@ -70,12 +69,13 @@ def download_media(url, media_type, quality):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
 
-            if media_type == "audio":
-                filename = os.path.splitext(filename)[0] + ".mp3"
-            elif not os.path.exists(filename):
-                possible = list(Path(temp_dir).glob("*"))
-                if possible:
-                    filename = str(possible[0])
+        if media_type == "audio":
+            filename = os.path.splitext(filename)[0] + ".mp3"
+
+        if not os.path.exists(filename):
+            files = list(Path(temp_dir).glob("*"))
+            if files:
+                filename = str(files[0])
 
         if not os.path.exists(filename):
             raise FileNotFoundError("Downloaded file not found")
@@ -91,11 +91,10 @@ def download_media(url, media_type, quality):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "🎬 Ahmed Media Downloader\n\n"
         "ابعتلي رابط الفيديو أو المنشور اللي عايز تحمله."
     )
-    await update.message.reply_text(text)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,10 +104,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ابعت رابط صحيح.")
         return
 
+    # حفظ الرابط بدل وضعه داخل callback_data
+    context.user_data["download_url"] = url
+
     keyboard = [
         [
-            InlineKeyboardButton("🎥 فيديو", callback_data=f"video|{url}"),
-            InlineKeyboardButton("🎵 MP3", callback_data=f"audio|{url}"),
+            InlineKeyboardButton(
+                "🎥 فيديو",
+                callback_data="choose_video"
+            ),
+            InlineKeyboardButton(
+                "🎵 MP3",
+                callback_data="choose_audio"
+            ),
         ]
     ]
 
@@ -122,48 +130,103 @@ async def quality_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    media_type, url = query.data.split("|", 1)
+    url = context.user_data.get("download_url")
 
-    if media_type == "video":
+    if not url:
+        await query.edit_message_text(
+            "❌ الرابط انتهت صلاحيته.\n"
+            "ابعت الرابط مرة تانية."
+        )
+        return
+
+    if query.data == "choose_video":
+
         keyboard = [
             [
-                InlineKeyboardButton("360p", callback_data=f"download|video|360p|{url}"),
-                InlineKeyboardButton("480p", callback_data=f"download|video|480p|{url}"),
+                InlineKeyboardButton(
+                    "360p",
+                    callback_data="download|video|360p"
+                ),
+                InlineKeyboardButton(
+                    "480p",
+                    callback_data="download|video|480p"
+                ),
             ],
             [
-                InlineKeyboardButton("720p", callback_data=f"download|video|720p|{url}"),
-                InlineKeyboardButton("1080p", callback_data=f"download|video|1080p|{url}"),
+                InlineKeyboardButton(
+                    "720p",
+                    callback_data="download|video|720p"
+                ),
+                InlineKeyboardButton(
+                    "1080p",
+                    callback_data="download|video|1080p"
+                ),
             ],
             [
-                InlineKeyboardButton("🔥 أفضل جودة", callback_data=f"download|video|best|{url}")
+                InlineKeyboardButton(
+                    "🔥 أفضل جودة",
+                    callback_data="download|video|best"
+                )
             ],
         ]
-        text = "اختار جودة الفيديو:"
-    else:
+
+        await query.edit_message_text(
+            "🎥 اختار جودة الفيديو:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif query.data == "choose_audio":
+
         keyboard = [
             [
-                InlineKeyboardButton("128 kbps", callback_data=f"download|audio|mp3_128|{url}"),
-                InlineKeyboardButton("192 kbps", callback_data=f"download|audio|mp3_192|{url}"),
+                InlineKeyboardButton(
+                    "128 kbps",
+                    callback_data="download|audio|mp3_128"
+                ),
+                InlineKeyboardButton(
+                    "192 kbps",
+                    callback_data="download|audio|mp3_192"
+                ),
             ],
             [
-                InlineKeyboardButton("320 kbps", callback_data=f"download|audio|mp3_320|{url}")
+                InlineKeyboardButton(
+                    "320 kbps",
+                    callback_data="download|audio|mp3_320"
+                )
             ],
         ]
-        text = "اختار جودة الصوت:"
 
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+        await query.edit_message_text(
+            "🎵 اختار جودة الصوت:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    _, media_type, quality, url = query.data.split("|", 3)
+    parts = query.data.split("|")
 
-    await query.edit_message_text("⏳ جاري التحميل...")
+    if len(parts) != 3:
+        await query.message.reply_text("❌ حدث خطأ في الطلب.")
+        return
+
+    _, media_type, quality = parts
+
+    url = context.user_data.get("download_url")
+
+    if not url:
+        await query.message.reply_text(
+            "❌ الرابط انتهت صلاحيته.\n"
+            "ابعت الرابط مرة تانية."
+        )
+        return
+
+    await query.edit_message_text(
+        "⏳ جاري التحميل...\n"
+        "ممكن يستغرق بعض الوقت."
+    )
 
     temp_dir = None
 
@@ -176,49 +239,71 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         with open(filename, "rb") as file:
+
             if media_type == "audio":
                 await query.message.reply_audio(
                     audio=file,
-                    caption="@AhmedMediaDL_bot",
+                    caption="🎵 Ahmed Media Downloader"
                 )
             else:
-                await query.message.reply_document(
-                    document=file,
-                    caption="@AhmedMediaDL_bot",
+                await query.message.reply_video(
+                    video=file,
+                    caption="🎬 Ahmed Media Downloader"
                 )
 
-        await query.message.reply_text("✅ تم التحميل بنجاح.")
+        await query.message.reply_text(
+            "✅ تم التحميل بنجاح."
+        )
 
     except Exception as e:
+
         print("DOWNLOAD ERROR:", repr(e))
+
         await query.message.reply_text(
-            "❌ حصل خطأ أثناء التحميل.\n"
+            "❌ حصل خطأ أثناء التحميل.\n\n"
             "جرب رابط تاني أو جودة أقل."
         )
 
     finally:
+
         if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True
+            )
 
 
 def main():
+
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(
-        quality_menu,
-        pattern=r"^(video|audio)\|"
-    ))
-    app.add_handler(CallbackQueryHandler(
-        download_callback,
-        pattern=r"^download\|"
-    ))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_url,
-    ))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            quality_menu,
+            pattern=r"^choose_(video|audio)$"
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            download_callback,
+            pattern=r"^download\|"
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_url
+        )
+    )
 
     print("Downloading Bot is running...")
+
     app.run_polling()
 
 
