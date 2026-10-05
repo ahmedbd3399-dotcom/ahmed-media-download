@@ -7,11 +7,13 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import yt_dlp
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,36 +24,51 @@ from telegram.ext import (
     filters,
 )
 
+
+# =========================
+# SETTINGS
+# =========================
+
 TOKEN = os.environ.get("BOT_TOKEN")
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN غير موجود.")
 
 DB_FILE = "users.db"
+
 MAX_FILE_SIZE = 49 * 1024 * 1024
 
-# غيّر السعر لاحقًا إذا أردت
 PREMIUM_STARS = 100
 
 
+# =========================
+# DATABASE
+# =========================
+
 def db():
     connection = sqlite3.connect(DB_FILE)
+
     connection.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             premium_until TEXT
         )
     """)
+
     connection.commit()
+
     return connection
 
 
 def is_premium(user_id):
+
     connection = db()
+
     row = connection.execute(
         "SELECT premium_until FROM users WHERE user_id = ?",
         (user_id,)
     ).fetchone()
+
     connection.close()
 
     if not row or not row[0]:
@@ -59,12 +76,15 @@ def is_premium(user_id):
 
     try:
         until = datetime.fromisoformat(row[0])
+
         return until > datetime.now(timezone.utc)
+
     except Exception:
         return False
 
 
 def activate_premium(user_id):
+
     connection = db()
 
     current = connection.execute(
@@ -75,12 +95,18 @@ def activate_premium(user_id):
     now = datetime.now(timezone.utc)
 
     if current and current[0]:
+
         try:
             old_until = datetime.fromisoformat(current[0])
+
             start = max(now, old_until)
+
         except Exception:
+
             start = now
+
     else:
+
         start = now
 
     premium_until = start + timedelta(days=30)
@@ -89,224 +115,476 @@ def activate_premium(user_id):
         """
         INSERT INTO users (user_id, premium_until)
         VALUES (?, ?)
+
         ON CONFLICT(user_id)
         DO UPDATE SET premium_until = excluded.premium_until
         """,
-        (user_id, premium_until.isoformat())
+        (
+            user_id,
+            premium_until.isoformat()
+        )
     )
 
     connection.commit()
+
     connection.close()
 
 
-def get_formats(url):
-    options = {
+# =========================
+# YT-DLP OPTIONS
+# =========================
+
+def base_yt_options():
+
+    return {
+
         "quiet": True,
-        "no_warnings": True,
+
+        "no_warnings": False,
+
         "noplaylist": True,
+
+        "retries": 3,
+
+        "fragment_retries": 3,
+
+        "continuedl": True,
+
+        # مهم جدًا لـ TikTok وبعض المواقع
+        "impersonate": "chrome",
+
+    }
+
+
+# =========================
+# GET AVAILABLE QUALITIES
+# =========================
+
+def get_formats(url):
+
+    options = {
+        **base_yt_options(),
+
         "skip_download": True,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
 
-    formats = []
+        info = ydl.extract_info(
+            url,
+            download=False
+        )
+
+    qualities = set()
+
+    allowed = {
+        144,
+        240,
+        360,
+        480,
+        720,
+        1080,
+        1440,
+        2160
+    }
 
     for fmt in info.get("formats", []):
+
         height = fmt.get("height")
-        if not height:
-            continue
 
-        if height not in [144, 240, 360, 480, 720, 1080, 1440, 2160]:
-            continue
+        if height in allowed:
 
-        if height not in formats:
-            formats.append(height)
+            qualities.add(height)
 
-    formats.sort()
-
-    return formats
+    return sorted(qualities)
 
 
-def download_media(url, media_type, quality, add_watermark):
-    temp_dir = tempfile.mkdtemp()
+# =========================
+# DOWNLOAD
+# =========================
+
+def download_media(
+    url,
+    media_type,
+    quality,
+    add_watermark
+):
+
+    temp_dir = tempfile.mkdtemp(
+        prefix="ahmed_media_"
+    )
 
     try:
+
         output = os.path.join(
             temp_dir,
-            "%(title)s.%(ext)s"
+            "%(title).80s.%(ext)s"
         )
+
+        # =====================
+        # AUDIO
+        # =====================
 
         if media_type == "audio":
 
-            bitrate = quality.replace("mp3_", "")
+            # MP3 يحتاج FFmpeg
+            if not shutil.which("ffmpeg"):
+
+                raise RuntimeError(
+                    "FFmpeg غير موجود على السيرفر. "
+                    "تحميل MP3 يحتاج FFmpeg."
+                )
+
+            bitrate = quality.replace(
+                "mp3_",
+                ""
+            )
 
             options = {
+
+                **base_yt_options(),
+
                 "format": "bestaudio/best",
+
                 "outtmpl": output,
-                "noplaylist": True,
-                "quiet": True,
+
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
+
                         "preferredcodec": "mp3",
+
                         "preferredquality": bitrate,
                     }
                 ],
             }
 
+        # =====================
+        # VIDEO
+        # =====================
+
         else:
 
             if quality == "best":
-                video_format = "bestvideo+bestaudio/best"
-            else:
+
                 video_format = (
-                    f"bestvideo[height<={quality}]"
-                    f"+bestaudio/"
-                    f"best[height<={quality}]"
+                    "best[ext=mp4]/"
+                    "best"
+                )
+
+            else:
+
+                height = int(quality)
+
+                # الأول نحاول ملف فيديو جاهز
+                # بدون دمج FFmpeg
+                video_format = (
+
+                    f"best[height<={height}]"
+                    f"[ext=mp4]/"
+
+                    f"best[height<={height}]/"
+
+                    "best"
                 )
 
             options = {
+
+                **base_yt_options(),
+
                 "format": video_format,
+
                 "outtmpl": output,
-                "noplaylist": True,
-                "quiet": True,
-                "merge_output_format": "mp4",
             }
 
+        # =====================
+        # DOWNLOAD
+        # =====================
+
+        print(
+            "DOWNLOAD:",
+            url,
+            media_type,
+            quality
+        )
+
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+
+            info = ydl.extract_info(
+                url,
+                download=True
+            )
+
+            filename = ydl.prepare_filename(
+                info
+            )
+
+        # =====================
+        # MP3 FILE NAME
+        # =====================
 
         if media_type == "audio":
-            filename = (
-                os.path.splitext(filename)[0] + ".mp3"
+
+            filename = str(
+                Path(filename).with_suffix(
+                    ".mp3"
+                )
             )
 
+        # =====================
+        # FIND FILE IF NEEDED
+        # =====================
+
         if not os.path.exists(filename):
-            files = list(Path(temp_dir).glob("*"))
+
+            files = [
+                p
+                for p in Path(temp_dir).glob("*")
+                if p.is_file()
+            ]
+
             if files:
-                filename = str(files[0])
+
+                filename = str(
+                    max(
+                        files,
+                        key=lambda p: p.stat().st_size
+                    )
+                )
+
+        # =====================
+        # FILE CHECK
+        # =====================
 
         if not os.path.exists(filename):
+
             raise FileNotFoundError(
-                "Downloaded file not found"
+                "Downloaded file not found."
             )
 
-        if os.path.getsize(filename) > MAX_FILE_SIZE:
-            raise ValueError(
-                "File أكبر من الحد المسموح به في Telegram."
+        file_size = os.path.getsize(
+            filename
+        )
+
+        print(
+            "FILE:",
+            filename,
+            "SIZE:",
+            file_size
+        )
+
+        if file_size > MAX_FILE_SIZE:
+
+            raise RuntimeError(
+                "الملف أكبر من 49MB."
             )
+
+        # =====================
+        # WATERMARK
+        # =====================
+
+        # سيتم تفعيل العلامة المائية
+        # بعد تثبيت FFmpeg ومعالجة الفيديو.
 
         return filename, temp_dir
 
     except Exception:
+
         shutil.rmtree(
             temp_dir,
             ignore_errors=True
         )
+
         raise
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# START
+# =========================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "⭐ Premium",
                 callback_data="premium"
             )
         ]
+
     ]
 
     await update.message.reply_text(
+
         "🎬 Ahmed Media Downloader\n\n"
+
         "ابعت رابط الفيديو أو المنشور هنا.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
     )
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# RECEIVE URL
+# =========================
+
+async def handle_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     url = update.message.text.strip()
 
-    if not url.startswith(("http://", "https://")):
+    if not url.startswith(
+        (
+            "http://",
+            "https://"
+        )
+    ):
+
         await update.message.reply_text(
             "❌ ابعت رابط صحيح."
         )
+
         return
 
-    context.user_data["download_url"] = url
+    context.user_data[
+        "download_url"
+    ] = url
 
     keyboard = [
+
         [
+
             InlineKeyboardButton(
                 "🎥 فيديو",
                 callback_data="choose_video"
             ),
+
             InlineKeyboardButton(
                 "🎵 MP3",
                 callback_data="choose_audio"
-            ),
+            )
+
         ],
+
         [
+
             InlineKeyboardButton(
                 "⭐ Premium",
                 callback_data="premium"
             )
+
         ]
+
     ]
 
     await update.message.reply_text(
+
         "اختار نوع التحميل:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
     )
 
 
-async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# PREMIUM MENU
+# =========================
+
+async def premium_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
+
     await query.answer()
 
-    if is_premium(query.from_user.id):
+    if is_premium(
+        query.from_user.id
+    ):
 
         await query.edit_message_text(
-            "⭐ أنت مشترك Premium بالفعل.\n"
+
+            "⭐ أنت مشترك Premium بالفعل.\n\n"
+
             "اشتراكك فعال لمدة 30 يوم من تاريخ التفعيل."
         )
+
         return
 
     keyboard = [
+
         [
+
             InlineKeyboardButton(
-                f"⭐ اشترك Premium — {PREMIUM_STARS} Stars",
+
+                f"⭐ اشترك Premium — "
+                f"{PREMIUM_STARS} Stars",
+
                 callback_data="buy_premium"
             )
+
         ]
+
     ]
 
     await query.edit_message_text(
+
         "⭐ Ahmed Media Downloader Premium\n\n"
+
         "المميزات:\n"
+
         "• بدون علامتنا المائية\n"
+
         "• مزايا Premium\n"
+
         "• الاشتراك لمدة 30 يوم\n\n"
+
         f"السعر: {PREMIUM_STARS} Stars",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
     )
 
 
-async def send_premium_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# PREMIUM PAYMENT
+# =========================
+
+async def send_premium_invoice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
+
     await query.answer()
 
     await context.bot.send_invoice(
+
         chat_id=query.from_user.id,
+
         title="Ahmed Media Downloader Premium",
+
         description="اشتراك Premium لمدة 30 يوم.",
-        payload=f"premium_30_{query.from_user.id}",
+
+        payload=(
+            f"premium_30_"
+            f"{query.from_user.id}"
+        ),
+
         currency="XTR",
+
         prices=[
             {
                 "label": "Premium 30 Days",
@@ -316,129 +594,306 @@ async def send_premium_invoice(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def precheckout(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.pre_checkout_query
 
-    await query.answer(ok=True)
+    await query.answer(
+        ok=True
+    )
 
 
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def successful_payment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
-    activate_premium(user_id)
+    activate_premium(
+        user_id
+    )
 
     await update.message.reply_text(
+
         "🎉 تم تفعيل Premium بنجاح!\n\n"
+
         "⭐ اشتراكك فعال لمدة 30 يوم."
     )
 
 
-async def quality_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# QUALITY MENU
+# =========================
+
+async def quality_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
+
     await query.answer()
 
-    url = context.user_data.get("download_url")
+    url = context.user_data.get(
+        "download_url"
+    )
 
     if not url:
+
         await query.edit_message_text(
             "❌ ابعت الرابط مرة ثانية."
         )
+
         return
+
+    # =====================
+    # AUDIO
+    # =====================
 
     if query.data == "choose_audio":
 
         keyboard = [
+
             [
+
                 InlineKeyboardButton(
                     "128 kbps",
-                    callback_data="download|audio|mp3_128"
+                    callback_data="dl:a:128"
                 ),
+
                 InlineKeyboardButton(
                     "192 kbps",
-                    callback_data="download|audio|mp3_192"
-                ),
+                    callback_data="dl:a:192"
+                )
+
             ],
+
             [
+
                 InlineKeyboardButton(
                     "320 kbps",
-                    callback_data="download|audio|mp3_320"
+                    callback_data="dl:a:320"
                 )
+
             ]
+
         ]
 
         await query.edit_message_text(
+
             "🎵 اختار جودة الصوت:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
         )
 
         return
+
+    # =====================
+    # VIDEO
+    # =====================
 
     await query.edit_message_text(
         "⏳ بفحص الجودات المتاحة..."
     )
 
     try:
+
         qualities = await asyncio.to_thread(
+
             get_formats,
+
             url
         )
 
+        # نحفظ الجودات للمستخدم
+        context.user_data[
+            "qualities"
+        ] = qualities
+
+        # لو الموقع لم يعطِ قائمة
+        if not qualities:
+
+            qualities = [360]
+
+            context.user_data[
+                "qualities"
+            ] = qualities
+
         keyboard = []
 
-        for height in qualities:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{height}p",
-                    callback_data=f"download|video|{height}"
-                )
-            ])
+        for index, height in enumerate(
+            qualities
+        ):
 
-        keyboard.append([
-            InlineKeyboardButton(
-                "🔥 أفضل جودة",
-                callback_data="download|video|best"
+            keyboard.append(
+
+                [
+
+                    InlineKeyboardButton(
+
+                        f"{height}p",
+
+                        # قصير جدًا
+                        callback_data=(
+                            f"dl:v:{index}"
+                        )
+                    )
+
+                ]
             )
-        ])
+
+        keyboard.append(
+
+            [
+
+                InlineKeyboardButton(
+
+                    "🔥 أفضل جودة",
+
+                    callback_data="dl:v:best"
+                )
+
+            ]
+        )
 
         await query.edit_message_text(
+
             "🎥 اختار الجودة:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
         )
 
     except Exception as e:
 
-        print("FORMAT ERROR:", repr(e))
+        print(
+            "FORMAT ERROR:",
+            repr(e)
+        )
 
         await query.edit_message_text(
-            "❌ لم أستطع قراءة جودات الرابط.\n"
+
+            "❌ لم أستطع قراءة جودات الرابط.\n\n"
+
             "جرب رابط فيديو آخر."
         )
 
 
-async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# DOWNLOAD BUTTON
+# =========================
+
+async def download_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
+
     await query.answer()
 
-    parts = query.data.split("|")
+    data = query.data.split(":")
 
-    if len(parts) != 3:
+    if len(data) != 3:
+
+        await query.edit_message_text(
+            "❌ الزر غير صالح."
+        )
+
         return
 
-    _, media_type, quality = parts
+    if data[0] != "dl":
 
-    url = context.user_data.get("download_url")
+        return
+
+    media_code = data[1]
+
+    value = data[2]
+
+    url = context.user_data.get(
+        "download_url"
+    )
 
     if not url:
-        await query.message.reply_text(
-            "❌ ابعت الرابط مرة ثانية."
+
+        await query.edit_message_text(
+
+            "❌ انتهت جلسة الرابط.\n"
+            "ابعت الرابط مرة ثانية."
         )
+
         return
 
-    premium = is_premium(query.from_user.id)
+    # =====================
+    # AUDIO
+    # =====================
+
+    if media_code == "a":
+
+        media_type = "audio"
+
+        quality = (
+            "mp3_" + value
+        )
+
+    # =====================
+    # VIDEO
+    # =====================
+
+    elif media_code == "v":
+
+        media_type = "video"
+
+        if value == "best":
+
+            quality = "best"
+
+        else:
+
+            qualities = context.user_data.get(
+                "qualities",
+                []
+            )
+
+            try:
+
+                index = int(value)
+
+                quality = str(
+                    qualities[index]
+                )
+
+            except (
+                ValueError,
+                IndexError
+            ):
+
+                await query.edit_message_text(
+
+                    "❌ قائمة الجودة انتهت.\n"
+                    "ابعت الرابط مرة ثانية."
+                )
+
+                return
+
+    else:
+
+        await query.edit_message_text(
+            "❌ اختيار غير صحيح."
+        )
+
+        return
+
+    # =====================
+    # START DOWNLOAD
+    # =====================
 
     await query.edit_message_text(
         "⏳ جاري التحميل..."
@@ -448,43 +903,71 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
 
-        filename, temp_dir = await asyncio.to_thread(
-            download_media,
-            url,
-            media_type,
-            quality,
-            not premium
+        filename, temp_dir = (
+            await asyncio.to_thread(
+
+                download_media,
+
+                url,
+
+                media_type,
+
+                quality,
+
+                False
+            )
         )
 
-        with open(filename, "rb") as file:
+        caption = (
+            "🎬 Ahmed Media Downloader"
+        )
+
+        # =====================
+        # SEND
+        # =====================
+
+        with open(
+            filename,
+            "rb"
+        ) as file:
 
             if media_type == "audio":
 
                 await query.message.reply_audio(
+
                     audio=file,
-                    caption=(
-                        "🎵 Ahmed Media Downloader"
-                        + (
-                            "\n⭐ Premium"
-                            if premium
-                            else ""
-                        )
-                    )
+
+                    caption=caption
                 )
 
             else:
 
-                await query.message.reply_video(
-                    video=file,
-                    caption=(
-                        "🎬 Ahmed Media Downloader"
-                        + (
-                            "\n⭐ Premium"
-                            if premium
-                            else ""
-                        )
+                try:
+
+                    await query.message.reply_video(
+
+                        video=file,
+
+                        caption=caption,
+
+                        supports_streaming=True
                     )
-                )
+
+                except Exception as send_error:
+
+                    print(
+                        "VIDEO SEND ERROR:",
+                        repr(send_error)
+                    )
+
+                    file.seek(0)
+
+                    await query.message.reply_document(
+
+                        document=file,
+
+                        caption=caption
+                    )
 
         await query.message.reply_text(
             "✅ تم التحميل بنجاح."
@@ -492,58 +975,108 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
 
-        print("DOWNLOAD ERROR:", repr(e))
+        # ده مهم جدًا عشان نعرف السبب الحقيقي
+        print(
+            "DOWNLOAD ERROR:",
+            repr(e)
+        )
 
         await query.message.reply_text(
-            "❌ حصل خطأ أثناء التحميل.\n"
-            "جرب جودة أقل أو رابطًا آخر."
+
+            "❌ حصل خطأ أثناء التحميل.\n\n"
+
+            "السبب التقني:\n"
+
+            f"{str(e)[:700]}"
         )
 
     finally:
 
         if temp_dir:
+
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True
             )
 
 
-def main():
+# =========================
+# ERROR HANDLER
+# =========================
 
-    app = Application.builder().token(TOKEN).build()
+async def error_handler(
+    update,
+    context
+):
 
-    app.add_handler(
-        CommandHandler("start", start)
+    print(
+        "BOT ERROR:",
+        repr(context.error)
     )
 
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    app = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
+    )
+
+    # START
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    # PREMIUM
     app.add_handler(
         CallbackQueryHandler(
+
             premium_menu,
+
             pattern=r"^premium$"
         )
     )
 
+    # BUY PREMIUM
     app.add_handler(
         CallbackQueryHandler(
+
             send_premium_invoice,
+
             pattern=r"^buy_premium$"
         )
     )
 
+    # VIDEO / AUDIO
     app.add_handler(
         CallbackQueryHandler(
+
             quality_menu,
+
             pattern=r"^choose_(video|audio)$"
         )
     )
 
+    # DOWNLOAD
     app.add_handler(
         CallbackQueryHandler(
+
             download_callback,
-            pattern=r"^download\|"
+
+            pattern=r"^dl:"
         )
     )
 
+    # PAYMENT
     app.add_handler(
         PreCheckoutQueryHandler(
             precheckout
@@ -552,22 +1085,36 @@ def main():
 
     app.add_handler(
         MessageHandler(
+
             filters.SUCCESSFUL_PAYMENT,
+
             successful_payment
         )
     )
 
+    # URL
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+
+            filters.TEXT
+            & ~filters.COMMAND,
+
             handle_url
         )
     )
 
-    print("Downloading Bot is running...")
+    # ERRORS
+    app.add_error_handler(
+        error_handler
+    )
+
+    print(
+        "Ahmed Media Downloader is running..."
+    )
 
     app.run_polling()
 
 
 if __name__ == "__main__":
+
     main()
