@@ -4,9 +4,11 @@ import shutil
 import sqlite3
 import asyncio
 import tempfile
+import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
 from PIL import Image, ImageDraw, ImageFont
@@ -31,9 +33,21 @@ from telegram.ext import (
 # SETTINGS
 # =========================
 
-TOKEN = os.environ.get("BOT_TOKEN")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # يقرأ التوكن من ملف .env لو موجود
+except Exception:
+    pass
+
+TOKEN = (
+    os.environ.get("BOT_TOKEN")
+    or os.environ.get("TOKEN")
+    or os.environ.get("TELEGRAM_BOT_TOKEN")
+)
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN غير موجود.")
+    raise RuntimeError(
+        "BOT_TOKEN غير موجود. حطه في ملف .env أو في Variables على السيرفر."
+    )
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 WATERMARK_TEXT = "@AhmedMediaDL_bot"
@@ -44,11 +58,58 @@ CHANNEL_URL = "https://t.me/AhmedMediaDL"
 
 DB_FILE = "users.db"
 MAX_FILE_SIZE = 49 * 1024 * 1024
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # حد تليجرام لتحميل الملفات اللي المستخدم يبعتها للبوت
 PREMIUM_STARS = 100
 FREE_MAX_HEIGHT = 720
 
+TTS_MAX_FREE = 500       # أقصى عدد حروف للنص (مجاني)
+TTS_MAX_PREMIUM = 3000   # أقصى عدد حروف للنص (Premium)
+
+# الأصوات المتاحة لتحويل النص لصوت (edge-tts)
+VOICES = {
+    "egf": ("🇪🇬 صوت مصري (أنثى)", "ar-EG-SalmaNeural"),
+    "egm": ("🇪🇬 صوت مصري (ذكر)", "ar-EG-ShakirNeural"),
+    "sam": ("🇸🇦 صوت سعودي (ذكر)", "ar-SA-HamedNeural"),
+    "enf": ("🇺🇸 English (female)", "en-US-AriaNeural"),
+}
+
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 LIMIT = asyncio.Semaphore(2)  # عمليتين تحميل كحد أقصى مع بعض
+
+
+# =========================
+# KEEP ALIVE (لموقع bot keep)
+# =========================
+
+class _PingHandler(BaseHTTPRequestHandler):
+    def _ok(self, body=True):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        if body:
+            self.wfile.write(b"Bot is running")
+
+    def do_GET(self):
+        self._ok()
+
+    def do_HEAD(self):
+        self._ok(body=False)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_keep_alive():
+    port = int(os.environ.get("PORT", "8080"))
+
+    def run():
+        try:
+            HTTPServer(("0.0.0.0", port), _PingHandler).serve_forever()
+        except Exception as e:
+            print("KEEP ALIVE SERVER ERROR:", repr(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    print(f"Keep-alive server on port {port}")
 
 
 # =========================
@@ -295,6 +356,38 @@ def download_media(url, media_type, quality, premium):
 
 
 # =========================
+# CONVERT FILE -> MP3
+# =========================
+
+def convert_to_mp3(src, out):
+    if not FFMPEG:
+        raise RuntimeError("FFmpeg غير متاح، لا يمكن التحويل.")
+    cmd = [
+        FFMPEG, "-y", "-i", src,
+        "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+        out,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", "ignore").lower()
+        if "does not contain any stream" in err or "output file is empty" in err:
+            raise RuntimeError("الملف ده مفيهوش صوت.")
+        raise RuntimeError("مقدرتش أحول الملف ده، جرب ملف تاني.")
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise RuntimeError("الملف ده مفيهوش صوت.")
+
+
+# =========================
+# TEXT -> SPEECH
+# =========================
+
+async def tts_to_file(text, voice, path):
+    import edge_tts
+    await edge_tts.Communicate(text, voice).save(path)
+
+
+# =========================
 # HANDLERS
 # =========================
 
@@ -357,20 +450,54 @@ async def check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ تمام! اختار نوع التحميل:", reply_markup=InlineKeyboardMarkup(kb)
         )
     else:
-        await q.edit_message_text("✅ تمام! ابعت رابط الفيديو.")
+        await q.edit_message_text(START_TEXT, reply_markup=main_menu_kb())
+
+
+START_TEXT = (
+    "🎬 Ahmed Media Downloader\n\n"
+    "اختار اللي عايزه من القايمة، أو ابعت مباشرة:\n"
+    "• رابط فيديو ← أحمله لك\n"
+    "• فيديو أو ملف صوت ← أحوله MP3\n"
+    "• نص عادي ← أحوله لصوت"
+)
+
+MENU_HELP = {
+    "dl": "🎥 *تحميل من رابط*\n\nابعت رابط الفيديو (تيك توك، إنستجرام، فيسبوك، يوتيوب، تويتر...) وأنا أحمله لك.",
+    "mp3": "🎵 *فيديو ← MP3*\n\nابعت أي فيديو أو ملف صوت أو فويس (حتى 20MB) وأنا أحوله MP3.\nلو الفيديو أكبر، ابعت رابطه بدل الملف.",
+    "tts": "🔊 *نص ← صوت*\n\nاكتب أو ابعت أي نص (حتى 500 حرف) وأنا أسألك على الصوت وأرجعه لك MP3.",
+}
+
+
+def main_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎥 تحميل من رابط", callback_data="menu:dl")],
+        [InlineKeyboardButton("🎵 فيديو ← MP3", callback_data="menu:mp3")],
+        [InlineKeyboardButton("🔊 نص ← صوت", callback_data="menu:tts")],
+        [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
+    ])
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.split(":", 1)[1]
+    if key == "home":
+        await q.edit_message_text(START_TEXT, reply_markup=main_menu_kb())
+        return
+    text = MENU_HELP.get(key)
+    if not text:
+        return
+    back = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ رجوع", callback_data="menu:home")]]
+    )
+    await q.edit_message_text(text, reply_markup=back, parse_mode="Markdown")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(context.bot, update.effective_user.id):
         await update.message.reply_text(JOIN_TEXT, reply_markup=join_keyboard())
         return
-    kb = [[InlineKeyboardButton("⭐ Premium", callback_data="premium")]]
-    await update.message.reply_text(
-        "🎬 Ahmed Media Downloader\n\n"
-        "ابعتلي رابط أي فيديو من تيك توك، إنستجرام، فيسبوك، يوتيوب، تويتر "
-        "وغيرهم، وأنا أحمله لك.",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+    await update.message.reply_text(START_TEXT, reply_markup=main_menu_kb())
 
 
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,27 +512,146 @@ async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"خطأ: {e}")
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    match = URL_RE.search(update.message.text or "")
-    if not match:
-        await update.message.reply_text("❌ ابعت رابط صحيح.")
-        return
-    context.user_data["download_url"] = match.group(0).rstrip(").,،")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لو الرسالة فيها رابط -> تحميل. لو نص عادي -> تحويل لصوت."""
+    text = (update.message.text or "").strip()
+    match = URL_RE.search(text)
 
     if not await is_allowed(context.bot, update.effective_user.id):
+        if match:
+            context.user_data["download_url"] = match.group(0).rstrip(").,،")
         await update.message.reply_text(JOIN_TEXT, reply_markup=join_keyboard())
         return
 
+    if match:
+        context.user_data["download_url"] = match.group(0).rstrip(").,،")
+        kb = [
+            [
+                InlineKeyboardButton("🎥 فيديو", callback_data="choose_video"),
+                InlineKeyboardButton("🎵 MP3", callback_data="choose_audio"),
+            ],
+            [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
+        ]
+        await update.message.reply_text(
+            "اختار نوع التحميل:", reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
+    # نص عادي -> تحويل لصوت
+    limit = TTS_MAX_PREMIUM if is_premium(update.effective_user.id) else TTS_MAX_FREE
+    if len(text) > limit:
+        await update.message.reply_text(
+            f"❌ النص طويل ({len(text)} حرف). الحد الأقصى {limit} حرف."
+            + ("" if limit == TTS_MAX_PREMIUM else "\n⭐ مشتركي Premium لهم حد أكبر.")
+        )
+        return
+
+    context.user_data["tts_text"] = text
     kb = [
-        [
-            InlineKeyboardButton("🎥 فيديو", callback_data="choose_video"),
-            InlineKeyboardButton("🎵 MP3", callback_data="choose_audio"),
-        ],
-        [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
+        [InlineKeyboardButton(label, callback_data=f"tts:{key}")]
+        for key, (label, _) in VOICES.items()
     ]
     await update.message.reply_text(
-        "اختار نوع التحميل:", reply_markup=InlineKeyboardMarkup(kb)
+        "🔊 اختار الصوت اللي عايز أقرأ به النص:",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
+
+
+async def tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.split(":", 1)[1]
+    if key not in VOICES:
+        return
+
+    if not await is_allowed(context.bot, q.from_user.id):
+        await q.edit_message_text(JOIN_TEXT, reply_markup=join_keyboard())
+        return
+
+    text = context.user_data.get("tts_text")
+    if not text:
+        await q.edit_message_text("❌ انتهت الجلسة. ابعت النص مرة ثانية.")
+        return
+
+    label, voice = VOICES[key]
+    await q.edit_message_text("⏳ جاري تحويل النص لصوت...")
+    temp_dir = tempfile.mkdtemp(prefix="amt_")
+    try:
+        out = os.path.join(temp_dir, "speech.mp3")
+        async with LIMIT:
+            await tts_to_file(text, voice, out)
+        if not os.path.exists(out) or os.path.getsize(out) == 0:
+            raise RuntimeError("معرفتش أطلع صوت من النص ده.")
+        with open(out, "rb") as f:
+            await q.message.reply_audio(
+                audio=f,
+                title="Text to Speech",
+                caption="🔊 @AhmedMediaDL_bot",
+                write_timeout=300,
+                read_timeout=300,
+            )
+        await q.edit_message_text("✅ تم تحويل النص لصوت.")
+    except ModuleNotFoundError:
+        print("TTS ERROR: edge-tts غير مثبت")
+        await q.edit_message_text("❌ ميزة النص لصوت مش جاهزة على السيرفر دلوقتي.")
+    except Exception as e:
+        print("TTS ERROR:", repr(e))
+        await q.edit_message_text(f"❌ حصل خطأ في التحويل.\n\n{str(e)[:200]}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def handle_file_to_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أي فيديو/صوت/فويس يتبعت للبوت يتحول MP3."""
+    msg = update.message
+    if not await is_allowed(context.bot, update.effective_user.id):
+        await msg.reply_text(JOIN_TEXT, reply_markup=join_keyboard())
+        return
+
+    att = msg.video or msg.audio or msg.voice or msg.video_note or msg.document
+    if not att:
+        return
+
+    if att.file_size and att.file_size > TG_DOWNLOAD_LIMIT:
+        await msg.reply_text(
+            "❌ الملف أكبر من 20MB، وتليجرام مابيسمحش للبوتات تحمل ملفات أكبر من كده.\n"
+            "جرب ملف أصغر، أو ابعت رابط الفيديو بدل الملف."
+        )
+        return
+
+    status = await msg.reply_text("⏳ جاري التحويل لـ MP3...")
+    temp_dir = tempfile.mkdtemp(prefix="amc_")
+    try:
+        tg_file = await att.get_file()
+        src = os.path.join(temp_dir, "input")
+        await tg_file.download_to_drive(src)
+
+        out = os.path.join(temp_dir, "audio.mp3")
+        async with LIMIT:
+            await asyncio.to_thread(convert_to_mp3, src, out)
+
+        if os.path.getsize(out) > MAX_FILE_SIZE:
+            raise RuntimeError("ملف الـ MP3 الناتج كبير على تليجرام.")
+
+        title = None
+        name = getattr(att, "file_name", None)
+        if name:
+            title = os.path.splitext(name)[0][:60]
+
+        with open(out, "rb") as f:
+            await msg.reply_audio(
+                audio=f,
+                title=title,
+                caption="🎵 @AhmedMediaDL_bot",
+                write_timeout=300,
+                read_timeout=300,
+            )
+        await status.edit_text("✅ تم التحويل لـ MP3.")
+    except Exception as e:
+        print("CONVERT ERROR:", repr(e))
+        await status.edit_text(f"❌ حصل خطأ أثناء التحويل.\n\n{str(e)[:200]}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,6 +667,7 @@ async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⭐ Ahmed Media Downloader Premium\n\n"
         "• بدون علامة مائية\n"
         "• جودات 1080p وأعلى\n"
+        f"• نصوص أطول لتحويل النص لصوت (حتى {TTS_MAX_PREMIUM} حرف)\n"
         "• مدة الاشتراك 30 يوم\n\n"
         f"السعر: {PREMIUM_STARS} Stars",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -583,6 +830,8 @@ async def error_handler(update, context):
 # =========================
 
 def main():
+    start_keep_alive()
+
     app = (
         Application.builder()
         .token(TOKEN)
@@ -590,6 +839,15 @@ def main():
         .read_timeout(60)
         .write_timeout(60)
         .build()
+    )
+
+    media_filter = (
+        filters.VIDEO
+        | filters.AUDIO
+        | filters.VOICE
+        | filters.VIDEO_NOTE
+        | filters.Document.VIDEO
+        | filters.Document.AUDIO
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -600,9 +858,12 @@ def main():
     app.add_handler(CallbackQueryHandler(quality_menu, pattern=r"^choose_(video|audio)$"))
     app.add_handler(CallbackQueryHandler(locked, pattern=r"^lock$"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
+    app.add_handler(CallbackQueryHandler(tts_callback, pattern=r"^tts:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(MessageHandler(media_filter, handle_file_to_mp3))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
     print("FFmpeg:", FFMPEG)
