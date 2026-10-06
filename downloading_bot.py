@@ -15,12 +15,17 @@ from PIL import Image, ImageDraw, ImageFont
 
 from telegram import (
     Update,
+    BotCommand,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
 )
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
+    TypeHandler,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -49,7 +54,8 @@ if not TOKEN:
         "BOT_TOKEN غير موجود. حطه في ملف .env أو في Variables على السيرفر."
     )
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+OWNER_ID = 7219900342  # صاحب البوت: Premium دائم
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0) or OWNER_ID
 WATERMARK_TEXT = "@AhmedMediaDL_bot"
 WATERMARK_LOGO = "watermark.png"   # لو حطيت اللوجو هنا هيستخدمه بدل النص
 COOKIES_FILE = "cookies.txt"       # اختياري (إنستجرام / فيسبوك)
@@ -57,9 +63,16 @@ CHANNEL_USERNAME = "@AhmedMediaDL"  # قناة الاشتراك الإجباري
 CHANNEL_URL = "https://t.me/AhmedMediaDL"
 
 DB_FILE = "users.db"
+MAINTENANCE_TEXT = "🛠 البوت متوقف مؤقتاً للصيانة.\nجرّب مرة تانية بعد شوية. شكراً لصبرك 🙏"
+MAINTENANCE_FLAG = "maintenance.flag"  # وجود الملف = وضع الصيانة شغال
 MAX_FILE_SIZE = 49 * 1024 * 1024
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # حد تليجرام لتحميل الملفات اللي المستخدم يبعتها للبوت
-PREMIUM_STARS = 100
+# خطط الاشتراك: الكود -> (عدد الأيام, السعر بالنجوم, الاسم)
+PLANS = {
+    "m1": (30, 30, "شهر"),
+    "m3": (90, 70, "3 شهور"),
+    "y1": (365, 150, "سنة"),
+}
 FREE_MAX_HEIGHT = 720
 
 TTS_MAX_FREE = 500       # أقصى عدد حروف للنص (مجاني)
@@ -70,8 +83,22 @@ VOICES = {
     "egf": ("🇪🇬 صوت مصري (أنثى)", "ar-EG-SalmaNeural"),
     "egm": ("🇪🇬 صوت مصري (ذكر)", "ar-EG-ShakirNeural"),
     "sam": ("🇸🇦 صوت سعودي (ذكر)", "ar-SA-HamedNeural"),
+    "sag": ("🇸🇦 صوت سعودي (أنثى)", "ar-SA-ZariyahNeural"),
+    "uae": ("🇦🇪 صوت إماراتي (ذكر)", "ar-AE-HamdanNeural"),
     "enf": ("🇺🇸 English (female)", "en-US-AriaNeural"),
+    "enm": ("🇬🇧 English (male)", "en-GB-RyanNeural"),
 }
+
+# أدوات الصوت/الفيديو اللي لمشتركي Premium فقط (عدّل القايمة زي ما تحب)
+PREMIUM_ACTIONS = {"cut", "compress"}
+CUT_MAX_SECONDS = 600     # أقصى مدة للمقطع المقصوص
+SPEEDS = ["0.75", "1.25", "1.5", "2"]
+TTS_RATES = [("🐢 بطيء", "-25"), ("🙂 عادي", "0"), ("🐇 سريع", "+25"), ("⚡ أسرع", "+50")]
+
+
+class UserError(Exception):
+    """خطأ رسالته مفهومة للمستخدم (مش عطل) — بنعرضه زي ما هو."""
+
 
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 LIMIT = asyncio.Semaphore(2)  # عمليتين تحميل كحد أقصى مع بعض
@@ -127,6 +154,8 @@ def db():
 
 
 def is_premium(user_id):
+    if user_id == OWNER_ID:
+        return True
     con = db()
     row = con.execute(
         "SELECT premium_until FROM users WHERE user_id = ?", (user_id,)
@@ -138,6 +167,21 @@ def is_premium(user_id):
         return datetime.fromisoformat(row[0]) > datetime.now(timezone.utc)
     except Exception:
         return False
+
+
+def premium_until(user_id):
+    """تاريخ انتهاء الاشتراك (datetime) أو None."""
+    con = db()
+    row = con.execute(
+        "SELECT premium_until FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    con.close()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(row[0])
+    except Exception:
+        return None
 
 
 def activate_premium(user_id, days=30):
@@ -336,7 +380,7 @@ def download_media(url, media_type, quality, premium):
         if media_type == "audio":
             files = [p for p in files if p.suffix == ".mp3"] or files
         if not files:
-            raise FileNotFoundError("لم يتم العثور على الملف بعد التحميل.")
+            raise UserError("لم يتم العثور على الملف بعد التحميل.")
         filename = str(max(files, key=lambda p: p.stat().st_size))
 
         if media_type == "video" and not premium:
@@ -344,7 +388,7 @@ def download_media(url, media_type, quality, premium):
 
         size = os.path.getsize(filename)
         if size > MAX_FILE_SIZE:
-            raise RuntimeError(
+            raise UserError(
                 f"الملف حجمه {size // (1024 * 1024)}MB وتليجرام يسمح بـ 49MB فقط. "
                 "جرب جودة أقل."
             )
@@ -372,19 +416,198 @@ def convert_to_mp3(src, out):
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", "ignore").lower()
         if "does not contain any stream" in err or "output file is empty" in err:
-            raise RuntimeError("الملف ده مفيهوش صوت.")
-        raise RuntimeError("مقدرتش أحول الملف ده، جرب ملف تاني.")
+            raise UserError("الملف ده مفيهوش صوت.")
+        raise UserError("مقدرتش أحول الملف ده، جرب ملف تاني.")
     if not os.path.exists(out) or os.path.getsize(out) == 0:
-        raise RuntimeError("الملف ده مفيهوش صوت.")
+        raise UserError("الملف ده مفيهوش صوت.")
+
+
+# =========================
+# MEDIA TOOLS (صوت / فيديو)
+# =========================
+
+MEDIA_ACTIONS = {
+    # action: (label, video_only)
+    "mp3": ("🎵 MP3", False),
+    "voice": ("🎤 فويس", False),
+    "speed": ("⏩ سرعة الصوت", False),
+    "volume": ("🔊 تقوية الصوت", False),
+    "cut": ("✂️ قص مقطع ⭐", False),
+    "frame": ("🖼 صورة من الفيديو", True),
+    "gif": ("🎞 مقطع متحرك", True),
+    "compress": ("🗜 ضغط الفيديو ⭐", True),
+}
+
+
+def _ff(args, timeout=900):
+    if not FFMPEG:
+        raise RuntimeError("FFmpeg غير متاح.")
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", *args]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise UserError("العملية أخدت وقت طويل، جرب ملف أقصر.")
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", "ignore").lower()
+        if "does not contain any stream" in err or "matches no streams" in err \
+                or "output file is empty" in err or "stream specifier" in err:
+            raise UserError("الملف ده مفيهوش الجزء المطلوب (صوت أو فيديو) للعملية دي.")
+        print("FFMPEG ERROR:", err[-300:])
+        raise UserError("مقدرتش أعالج الملف ده، جرب ملف تاني.")
+
+
+def _check_out(out):
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise UserError("العملية ما طلعتش نتيجة، جرب ملف تاني.")
+    if os.path.getsize(out) > MAX_FILE_SIZE:
+        raise UserError("الناتج أكبر من حد تليجرام (49MB).")
+
+
+def parse_time(t):
+    t = t.strip().replace("،", ".").replace(",", ".")
+    parts = t.split(":")
+    if not 1 <= len(parts) <= 3:
+        raise ValueError
+    total = 0.0
+    for p in parts:
+        total = total * 60 + float(p)
+    return total
+
+
+def parse_cut(text):
+    """'0:10-0:45' أو '10 الى 45' -> (10.0, 45.0)"""
+    bits = re.split(r"\s*(?:-|–|—|to|الى|إلى)\s*", text.strip(), maxsplit=1)
+    if len(bits) != 2:
+        raise ValueError
+    start, end = parse_time(bits[0]), parse_time(bits[1])
+    if start < 0 or end <= start:
+        raise ValueError
+    return start, end
+
+
+def process_media(src, temp_dir, action, param, is_video):
+    """يرجع (مسار الناتج, نوعه): audio / voice / video / animation / photo"""
+    if action == "mp3":
+        out = os.path.join(temp_dir, "audio.mp3")
+        convert_to_mp3(src, out)
+        _check_out(out)
+        return out, "audio"
+
+    if action == "voice":
+        out = os.path.join(temp_dir, "voice.ogg")
+        _ff(["-i", src, "-vn", "-c:a", "libopus", "-b:a", "48k", "-ac", "1", out])
+        _check_out(out)
+        return out, "voice"
+
+    if action == "speed":
+        if param not in SPEEDS:
+            raise UserError("سرعة غير مدعومة.")
+        out = os.path.join(temp_dir, "speed.mp3")
+        _ff(["-i", src, "-vn", "-filter:a", f"atempo={param}",
+             "-c:a", "libmp3lame", "-b:a", "192k", out])
+        _check_out(out)
+        return out, "audio"
+
+    if action == "volume":
+        out = os.path.join(temp_dir, "louder.mp3")
+        _ff(["-i", src, "-vn", "-filter:a", "loudnorm=I=-14:TP=-1.5:LRA=11",
+             "-c:a", "libmp3lame", "-b:a", "192k", out])
+        _check_out(out)
+        return out, "audio"
+
+    if action == "cut":
+        start, end = param
+        dur = min(end - start, CUT_MAX_SECONDS)
+        if is_video:
+            out = os.path.join(temp_dir, "cut.mp4")
+            _ff(["-ss", str(start), "-t", str(dur), "-i", src,
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart", out])
+            _check_out(out)
+            return out, "video"
+        out = os.path.join(temp_dir, "cut.mp3")
+        _ff(["-ss", str(start), "-t", str(dur), "-i", src, "-vn",
+             "-c:a", "libmp3lame", "-b:a", "192k", out])
+        _check_out(out)
+        return out, "audio"
+
+    if action == "frame":
+        out = os.path.join(temp_dir, "frame.jpg")
+        try:
+            _ff(["-ss", "1", "-i", src, "-frames:v", "1", "-q:v", "2", out])
+            _check_out(out)
+        except UserError:
+            _ff(["-i", src, "-frames:v", "1", "-q:v", "2", out])
+            _check_out(out)
+        return out, "photo"
+
+    if action == "gif":
+        out = os.path.join(temp_dir, "clip.mp4")
+        _ff(["-i", src, "-t", "8", "-an",
+             "-vf", "fps=15,scale='min(480,iw)':-2",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", out])
+        _check_out(out)
+        return out, "animation"
+
+    if action == "compress":
+        out = os.path.join(temp_dir, "small.mp4")
+        _ff(["-i", src, "-vf", "scale='min(854,iw)':-2",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
+             "-movflags", "+faststart", out])
+        _check_out(out)
+        return out, "video"
+
+    raise UserError("عملية غير مدعومة.")
+
+
+def fetch_extra(url, kind):
+    """kind: thumb (صورة الغلاف) أو subs (الترجمة). يرجع (قايمة ملفات, temp_dir)"""
+    temp_dir = tempfile.mkdtemp(prefix="amx_")
+    try:
+        opts = {**base_opts(), "skip_download": True,
+                "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s")}
+        if kind == "thumb":
+            opts["writethumbnail"] = True
+        else:
+            opts.update({
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["ar", "en"],
+                "subtitlesformat": "srt/vtt/best",
+            })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        if kind == "thumb":
+            imgs = [p for p in Path(temp_dir).glob("*")
+                    if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")]
+            if not imgs:
+                raise UserError("الرابط ده مفيهوش صورة غلاف.")
+            jpg = os.path.join(temp_dir, "cover.jpg")
+            Image.open(imgs[0]).convert("RGB").save(jpg, "JPEG", quality=92)
+            return [jpg], temp_dir
+
+        subs = sorted(p for p in Path(temp_dir).glob("*")
+                      if p.suffix.lower() in (".srt", ".vtt"))
+        if not subs:
+            raise UserError("الفيديو ده مفيهوش ترجمة (عربي أو إنجليزي).")
+        return [str(p) for p in subs[:2]], temp_dir
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 # =========================
 # TEXT -> SPEECH
 # =========================
 
-async def tts_to_file(text, voice, path):
+async def tts_to_file(text, voice, path, rate="0"):
     import edge_tts
-    await edge_tts.Communicate(text, voice).save(path)
+    r = int(rate)
+    await edge_tts.Communicate(text, voice, rate=f"{r:+d}%").save(path)
 
 
 # =========================
@@ -392,6 +615,8 @@ async def tts_to_file(text, voice, path):
 # =========================
 
 def short_error(e):
+    if isinstance(e, UserError):
+        return str(e)
     text = str(e)
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     low = text.lower()
@@ -401,7 +626,8 @@ def short_error(e):
         return "الرابط ده مش مدعوم."
     if "unavailable" in low or "removed" in low or "not found" in low:
         return "الفيديو غير متاح أو اتحذف."
-    return text[:300]
+    print("UNEXPECTED ERROR:", text[:300])
+    return MAINTENANCE_TEXT
 
 
 JOIN_TEXT = (
@@ -444,6 +670,10 @@ async def check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🎥 فيديو", callback_data="choose_video"),
                 InlineKeyboardButton("🎵 MP3", callback_data="choose_audio"),
             ],
+            [
+                InlineKeyboardButton("🖼 صورة الغلاف", callback_data="extra:thumb"),
+                InlineKeyboardButton("📝 الترجمة", callback_data="extra:subs"),
+            ],
             [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
         ]
         await q.edit_message_text(
@@ -457,21 +687,21 @@ START_TEXT = (
     "🎬 Ahmed Media Downloader\n\n"
     "اختار اللي عايزه من القايمة، أو ابعت مباشرة:\n"
     "• رابط فيديو ← أحمله لك\n"
-    "• فيديو أو ملف صوت ← أحوله MP3\n"
+    "• فيديو أو ملف صوت ← أدوات (MP3، فويس، قص، سرعة، ضغط...)\n"
     "• نص عادي ← أحوله لصوت"
 )
 
 MENU_HELP = {
     "dl": "🎥 *تحميل من رابط*\n\nابعت رابط الفيديو (تيك توك، إنستجرام، فيسبوك، يوتيوب، تويتر...) وأنا أحمله لك.",
-    "mp3": "🎵 *فيديو ← MP3*\n\nابعت أي فيديو أو ملف صوت أو فويس (حتى 20MB) وأنا أحوله MP3.\nلو الفيديو أكبر، ابعت رابطه بدل الملف.",
-    "tts": "🔊 *نص ← صوت*\n\nاكتب أو ابعت أي نص (حتى 500 حرف) وأنا أسألك على الصوت وأرجعه لك MP3.",
+    "mp3": "🎛 *أدوات الصوت والفيديو*\n\nابعت أي فيديو أو ملف صوت أو فويس (حتى 20MB) وهتختار:\n• 🎵 MP3 • 🎤 فويس • ⏩ سرعة الصوت • 🔊 تقوية الصوت\n• ✂️ قص مقطع ⭐ • 🖼 صورة من الفيديو • 🎞 مقطع متحرك • 🗜 ضغط الفيديو ⭐\n\nلو الفيديو أكبر، ابعت رابطه بدل الملف.",
+    "tts": "🔊 *نص ← صوت*\n\nاكتب أو ابعت أي نص (حتى 500 حرف) واختار الصوت والسرعة وأرجعه لك MP3.",
 }
 
 
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎥 تحميل من رابط", callback_data="menu:dl")],
-        [InlineKeyboardButton("🎵 فيديو ← MP3", callback_data="menu:mp3")],
+        [InlineKeyboardButton("🎛 أدوات الصوت والفيديو", callback_data="menu:mp3")],
         [InlineKeyboardButton("🔊 نص ← صوت", callback_data="menu:tts")],
         [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
     ])
@@ -517,6 +747,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     match = URL_RE.search(text)
 
+    # لو مستني وقت القص من المستخدم
+    if context.user_data.get("await_cut") and not match:
+        try:
+            cut = parse_cut(text)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ الصيغة مش مفهومة. اكتب البداية والنهاية كده:\n0:10-0:45\nأو: 10-45 (بالثواني)"
+            )
+            return
+        context.user_data["await_cut"] = False
+        status = await update.message.reply_text("⏳ جاري القص...")
+        await run_media_job(status, context, update.effective_user.id, "cut", cut)
+        return
+    context.user_data["await_cut"] = False
+
     if not await is_allowed(context.bot, update.effective_user.id):
         if match:
             context.user_data["download_url"] = match.group(0).rstrip(").,،")
@@ -529,6 +774,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton("🎥 فيديو", callback_data="choose_video"),
                 InlineKeyboardButton("🎵 MP3", callback_data="choose_audio"),
+            ],
+            [
+                InlineKeyboardButton("🖼 صورة الغلاف", callback_data="extra:thumb"),
+                InlineKeyboardButton("📝 الترجمة", callback_data="extra:subs"),
             ],
             [InlineKeyboardButton("⭐ Premium", callback_data="premium")],
         ]
@@ -560,7 +809,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    key = q.data.split(":", 1)[1]
+    parts = q.data.split(":")
+    key = parts[1] if len(parts) > 1 else ""
     if key not in VOICES:
         return
 
@@ -573,15 +823,26 @@ async def tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ انتهت الجلسة. ابعت النص مرة ثانية.")
         return
 
+    # الخطوة التانية: اختيار سرعة القراءة
+    if len(parts) == 2:
+        kb = [[InlineKeyboardButton(label, callback_data=f"tts:{key}:{rate}")]
+              for label, rate in TTS_RATES]
+        await q.edit_message_text("⏩ اختار سرعة القراءة:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    rate = parts[2]
+    if rate not in {r for _, r in TTS_RATES}:
+        return
+
     label, voice = VOICES[key]
     await q.edit_message_text("⏳ جاري تحويل النص لصوت...")
     temp_dir = tempfile.mkdtemp(prefix="amt_")
     try:
         out = os.path.join(temp_dir, "speech.mp3")
         async with LIMIT:
-            await tts_to_file(text, voice, out)
+            await tts_to_file(text, voice, out, rate)
         if not os.path.exists(out) or os.path.getsize(out) == 0:
-            raise RuntimeError("معرفتش أطلع صوت من النص ده.")
+            raise UserError("معرفتش أطلع صوت من النص ده.")
         with open(out, "rb") as f:
             await q.message.reply_audio(
                 audio=f,
@@ -591,18 +852,34 @@ async def tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 read_timeout=300,
             )
         await q.edit_message_text("✅ تم تحويل النص لصوت.")
+    except UserError as e:
+        await q.edit_message_text(f"❌ {e}")
     except ModuleNotFoundError:
         print("TTS ERROR: edge-tts غير مثبت")
-        await q.edit_message_text("❌ ميزة النص لصوت مش جاهزة على السيرفر دلوقتي.")
+        await q.edit_message_text(MAINTENANCE_TEXT)
     except Exception as e:
         print("TTS ERROR:", repr(e))
-        await q.edit_message_text(f"❌ حصل خطأ في التحويل.\n\n{str(e)[:200]}")
+        await q.edit_message_text(MAINTENANCE_TEXT)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def media_menu_kb(is_video):
+    rows, row = [], []
+    for action, (label, video_only) in MEDIA_ACTIONS.items():
+        if video_only and not is_video:
+            continue
+        row.append(InlineKeyboardButton(label, callback_data=f"m:{action}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
 async def handle_file_to_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي فيديو/صوت/فويس يتبعت للبوت يتحول MP3."""
+    """أي فيديو/صوت/فويس يتبعت للبوت -> قايمة أدوات."""
     msg = update.message
     if not await is_allowed(context.bot, update.effective_user.id):
         await msg.reply_text(JOIN_TEXT, reply_markup=join_keyboard())
@@ -619,83 +896,311 @@ async def handle_file_to_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    status = await msg.reply_text("⏳ جاري التحويل لـ MP3...")
+    mime = (getattr(att, "mime_type", "") or "").lower()
+    is_video = bool(msg.video or msg.video_note or mime.startswith("video/"))
+    context.user_data["await_cut"] = False
+    context.user_data["media"] = {
+        "file_id": att.file_id,
+        "is_video": is_video,
+        "name": getattr(att, "file_name", None),
+    }
+    await msg.reply_text(
+        "🎛 اختار اللي عايز تعمله في الملف:\n(⭐ = لمشتركي Premium)",
+        reply_markup=media_menu_kb(is_video),
+    )
+
+
+async def run_media_job(status, context, user_id, action, param=None):
+    """ينزّل الملف المحفوظ، يطبّق الأداة، ويبعت الناتج."""
+    media = context.user_data.get("media")
+    if not media:
+        await status.edit_text("❌ انتهت الجلسة. ابعت الملف مرة ثانية.")
+        return
+
     temp_dir = tempfile.mkdtemp(prefix="amc_")
     try:
-        tg_file = await att.get_file()
+        tg_file = await context.bot.get_file(media["file_id"])
         src = os.path.join(temp_dir, "input")
         await tg_file.download_to_drive(src)
 
-        out = os.path.join(temp_dir, "audio.mp3")
         async with LIMIT:
-            await asyncio.to_thread(convert_to_mp3, src, out)
-
-        if os.path.getsize(out) > MAX_FILE_SIZE:
-            raise RuntimeError("ملف الـ MP3 الناتج كبير على تليجرام.")
+            out, kind = await asyncio.to_thread(
+                process_media, src, temp_dir, action, param, media["is_video"]
+            )
 
         title = None
-        name = getattr(att, "file_name", None)
-        if name:
-            title = os.path.splitext(name)[0][:60]
-
+        if media.get("name"):
+            title = os.path.splitext(media["name"])[0][:60]
+        cap = "@AhmedMediaDL_bot"
+        opts = dict(write_timeout=300, read_timeout=300)
         with open(out, "rb") as f:
-            await msg.reply_audio(
-                audio=f,
-                title=title,
-                caption="🎵 @AhmedMediaDL_bot",
-                write_timeout=300,
-                read_timeout=300,
-            )
-        await status.edit_text("✅ تم التحويل لـ MP3.")
+            if kind == "audio":
+                await status.reply_audio(audio=f, title=title, caption="🎵 " + cap, **opts)
+            elif kind == "voice":
+                await status.reply_voice(voice=f, caption="🎤 " + cap, **opts)
+            elif kind == "photo":
+                await status.reply_photo(photo=f, caption="🖼 " + cap, **opts)
+            elif kind == "animation":
+                await status.reply_animation(animation=f, caption="🎞 " + cap, **opts)
+            else:
+                try:
+                    await status.reply_video(video=f, caption="🎬 " + cap,
+                                             supports_streaming=True, **opts)
+                except Exception as send_error:
+                    print("VIDEO SEND ERROR:", repr(send_error))
+                    f.seek(0)
+                    await status.reply_document(document=f, caption="🎬 " + cap, **opts)
+        await status.edit_text("✅ تم.")
+    except UserError as e:
+        await status.edit_text(f"❌ {e}")
     except Exception as e:
-        print("CONVERT ERROR:", repr(e))
-        await status.edit_text(f"❌ حصل خطأ أثناء التحويل.\n\n{str(e)[:200]}")
+        print("MEDIA JOB ERROR:", action, repr(e))
+        await status.edit_text(MAINTENANCE_TEXT)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def media_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action not in MEDIA_ACTIONS:
+        await q.answer()
+        return
+
+    if not await is_allowed(context.bot, q.from_user.id):
+        await q.answer()
+        await q.edit_message_text(JOIN_TEXT, reply_markup=join_keyboard())
+        return
+
+    media = context.user_data.get("media")
+    if not media:
+        await q.answer()
+        await q.edit_message_text("❌ انتهت الجلسة. ابعت الملف مرة ثانية.")
+        return
+
+    if action in PREMIUM_ACTIONS and not is_premium(q.from_user.id):
+        await q.answer("الأداة دي لمشتركي Premium ⭐", show_alert=True)
+        return
+    if MEDIA_ACTIONS[action][1] and not media["is_video"]:
+        await q.answer("الأداة دي للفيديو بس.", show_alert=True)
+        return
+    await q.answer()
+
+    if action == "speed" and len(parts) == 2:
+        kb = [[InlineKeyboardButton(f"{sp}x", callback_data=f"m:speed:{sp}") for sp in SPEEDS]]
+        await q.edit_message_text("⏩ اختار سرعة الصوت:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if action == "cut":
+        context.user_data["await_cut"] = True
+        await q.edit_message_text(
+            "✂️ ابعت البداية والنهاية للمقطع، مثال:\n0:10-0:45\nأو بالثواني: 10-45\n"
+            f"(أقصى مدة {CUT_MAX_SECONDS // 60} دقايق)"
+        )
+        return
+
+    param = parts[2] if len(parts) > 2 else None
+    await q.edit_message_text("⏳ جاري المعالجة...")
+    await run_media_job(q.message, context, q.from_user.id, action, param)
+
+
+async def extra_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صورة الغلاف / الترجمة من رابط."""
+    q = update.callback_query
+    await q.answer()
+    kind = q.data.split(":", 1)[1]
+    if kind not in ("thumb", "subs"):
+        return
+
+    if not await is_allowed(context.bot, q.from_user.id):
+        await q.edit_message_text(JOIN_TEXT, reply_markup=join_keyboard())
+        return
+
+    url = context.user_data.get("download_url")
+    if not url:
+        await q.edit_message_text("❌ انتهت الجلسة. ابعت الرابط مرة ثانية.")
+        return
+
+    await q.edit_message_text("⏳ جاري الجلب...")
+    temp_dir = None
+    try:
+        async with LIMIT:
+            files, temp_dir = await asyncio.to_thread(fetch_extra, url, kind)
+        for path in files:
+            with open(path, "rb") as f:
+                if kind == "thumb":
+                    try:
+                        await q.message.reply_photo(photo=f, caption="🖼 @AhmedMediaDL_bot",
+                                                    write_timeout=120, read_timeout=120)
+                    except Exception as send_error:
+                        print("PHOTO SEND ERROR:", repr(send_error))
+                        f.seek(0)
+                        await q.message.reply_document(document=f, write_timeout=120, read_timeout=120)
+                else:
+                    await q.message.reply_document(document=f, caption="📝 @AhmedMediaDL_bot",
+                                                   write_timeout=120, read_timeout=120)
+        await q.edit_message_text("✅ تم.")
+    except Exception as e:
+        print("EXTRA ERROR:", kind, repr(e))
+        await q.edit_message_text(f"❌ {short_error(e)}")
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def premium_view(user_id):
+    """نص + أزرار صفحة Premium (للأمر والزر)."""
+    month_price = PLANS["m1"][1]
+    lines = [
+        "⭐ Ahmed Media Downloader Premium\n",
+        "• بدون علامة مائية",
+        "• جودات 1080p وأعلى",
+        f"• نصوص أطول لتحويل النص لصوت (حتى {TTS_MAX_PREMIUM} حرف)",
+        "• أدوات مقفولة: قص المقاطع وضغط الفيديو\n",
+        "🎁 العروض:",
+    ]
+    kb = []
+    for code, (days, stars, name) in PLANS.items():
+        full = month_price * days // 30
+        save = ""
+        if stars < full:
+            pct = round((1 - stars / full) * 100)
+            save = f" — وفّر {pct}%"
+            lines.append(f"• {name}: {stars} ⭐{save}")
+        else:
+            lines.append(f"• {name}: {stars} ⭐")
+        kb.append([InlineKeyboardButton(
+            f"⭐ {name} — {stars} Stars{save}", callback_data=f"buy:{code}"
+        )])
+
+    if user_id in (OWNER_ID, ADMIN_ID):
+        head = "👑 أنت صاحب البوت — Premium دائم.\n\n"
+    elif is_premium(user_id):
+        until = premium_until(user_id)
+        head = f"✅ اشتراكك فعال لحد {until:%Y-%m-%d}. تقدر تجدد من هنا (بتتضاف على المدة الحالية).\n\n"
+    else:
+        head = ""
+    return head + "\n".join(lines), InlineKeyboardMarkup(kb)
 
 
 async def premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if is_premium(q.from_user.id):
-        await q.edit_message_text("⭐ أنت مشترك Premium وفعال.")
-        return
-    kb = [[InlineKeyboardButton(
-        f"⭐ اشترك — {PREMIUM_STARS} Stars", callback_data="buy_premium"
-    )]]
-    await q.edit_message_text(
-        "⭐ Ahmed Media Downloader Premium\n\n"
-        "• بدون علامة مائية\n"
-        "• جودات 1080p وأعلى\n"
-        f"• نصوص أطول لتحويل النص لصوت (حتى {TTS_MAX_PREMIUM} حرف)\n"
-        "• مدة الاشتراك 30 يوم\n\n"
-        f"السعر: {PREMIUM_STARS} Stars",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+    text, kb = premium_view(q.from_user.id)
+    await q.edit_message_text(text, reply_markup=kb)
+
+
+async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = premium_view(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in (OWNER_ID, ADMIN_ID):
+        await update.message.reply_text("👑 حسابك: صاحب البوت — Premium دائم.")
+    elif is_premium(uid):
+        until = premium_until(uid)
+        await update.message.reply_text(f"⭐ اشتراكك Premium فعال لحد {until:%Y-%m-%d}.")
+    else:
+        await update.message.reply_text(
+            "حسابك مجاني (حتى 720p وبعلامة مائية).\nللاشتراك: /premium"
+        )
+
+
+HELP_TEXT = (
+    "📖 أوامر البوت:\n\n"
+    "/start — القائمة الرئيسية\n"
+    "/help — الأوامر وشرح الاستخدام\n"
+    "/premium — الاشتراك والعروض ⭐\n"
+    "/status — حالة اشتراكي\n"
+    "/cancel — إلغاء العملية الحالية\n\n"
+    "💡 طريقة الاستخدام:\n"
+    "• ابعت رابط فيديو ← تحميل (فيديو / MP3 / غلاف / ترجمة)\n"
+    "• ابعت فيديو أو صوت ← أدوات (MP3، فويس، قص، سرعة، ضغط...)\n"
+    "• اكتب نص عادي ← أحوله لصوت"
+)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["await_cut"] = False
+    await update.message.reply_text("✅ تم الإلغاء. ابعت رابط أو ملف أو نص عشان نبدأ من جديد.")
+
+
+async def post_init(app):
+    """قايمة الاختصارات اللي بتظهر في زر (Menu) جنب خانة الكتابة."""
+    user_cmds = [
+        BotCommand("start", "القائمة الرئيسية"),
+        BotCommand("help", "الأوامر وشرح الاستخدام"),
+        BotCommand("premium", "الاشتراك والعروض ⭐"),
+        BotCommand("status", "حالة اشتراكي"),
+        BotCommand("cancel", "إلغاء العملية الحالية"),
+    ]
+    try:
+        await app.bot.set_my_commands(user_cmds)
+        for admin in {OWNER_ID, ADMIN_ID}:
+            await app.bot.set_my_commands(
+                user_cmds + [
+                    BotCommand("grant", "تفعيل Premium لمستخدم (أدمن)"),
+                    BotCommand("maintenance", "وضع الصيانة on/off (أدمن)"),
+                ],
+                scope=BotCommandScopeChat(chat_id=admin),
+            )
+    except Exception as e:
+        print("SET COMMANDS ERROR:", repr(e))
 
 
 async def send_premium_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    code = q.data.split(":", 1)[1]
+    if code not in PLANS:
+        return
+    days, stars, name = PLANS[code]
     await context.bot.send_invoice(
         chat_id=q.from_user.id,
-        title="Ahmed Media Downloader Premium",
-        description="اشتراك Premium لمدة 30 يوم.",
-        payload=f"premium_30_{q.from_user.id}",
+        title=f"Premium — {name}",
+        description=f"اشتراك Premium لمدة {name} ({days} يوم).",
+        payload=f"premium:{code}:{q.from_user.id}",
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice("Premium 30 Days", PREMIUM_STARS)],
+        prices=[LabeledPrice(f"Premium {name}", stars)],
     )
 
 
+def plan_from_payment(payment):
+    """يرجّع كود الخطة من الفاتورة (والمبلغ لازم يطابق السعر)."""
+    parts = (payment.invoice_payload or "").split(":")
+    if len(parts) >= 2 and parts[0] == "premium" and parts[1] in PLANS:
+        code = parts[1]
+        if payment.total_amount == PLANS[code][1]:
+            return code
+        return None
+    return None
+
+
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
+    pq = update.pre_checkout_query
+    legacy = (pq.invoice_payload or "").startswith("premium_30_")  # فواتير قديمة
+    if legacy or plan_from_payment(pq):
+        await pq.answer(ok=True)
+    else:
+        await pq.answer(ok=False, error_message="الفاتورة دي غير صالحة، افتح /premium وجرب تاني.")
 
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    activate_premium(update.effective_user.id)
+    pay = update.message.successful_payment
+    code = plan_from_payment(pay)
+    days, name = (PLANS[code][0], PLANS[code][2]) if code else (30, "شهر")
+    activate_premium(update.effective_user.id, days)
+    until = premium_until(update.effective_user.id)
     await update.message.reply_text(
-        "🎉 تم تفعيل Premium بنجاح!\n⭐ اشتراكك فعال لمدة 30 يوم."
+        f"🎉 تم تفعيل Premium بنجاح!\n⭐ الخطة: {name}\n📅 فعال لحد {until:%Y-%m-%d}."
     )
 
 
@@ -727,7 +1232,8 @@ async def quality_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         heights, has_video = await asyncio.to_thread(get_formats, url)
     except Exception as e:
         print("FORMAT ERROR:", repr(e))
-        await q.edit_message_text(f"❌ مقدرتش أقرأ الرابط.\n\n{short_error(e)}")
+        msg = short_error(e)
+        await q.edit_message_text(msg if msg == MAINTENANCE_TEXT else f"❌ مقدرتش أقرأ الرابط.\n\n{msg}")
         return
 
     premium = is_premium(q.from_user.id)
@@ -815,7 +1321,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print("DOWNLOAD ERROR:", repr(e))
-        await q.edit_message_text(f"❌ حصل خطأ أثناء التحميل.\n\n{short_error(e)}")
+        msg = short_error(e)
+        await q.edit_message_text(msg if msg == MAINTENANCE_TEXT else f"❌ حصل خطأ أثناء التحميل.\n\n{msg}")
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -823,6 +1330,57 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context):
     print("BOT ERROR:", repr(context.error))
+    # أخطاء الشبكة المؤقتة: متبعتش رسالة صيانة
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        return
+    try:
+        if isinstance(update, Update):
+            if update.callback_query:
+                await update.callback_query.answer(MAINTENANCE_TEXT, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(MAINTENANCE_TEXT)
+    except Exception as e:
+        print("MAINTENANCE NOTICE FAILED:", repr(e))
+
+
+def maintenance_on():
+    return os.path.exists(MAINTENANCE_FLAG)
+
+
+async def maintenance_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """وقت الصيانة: كل المستخدمين يشوفوا رسالة الصيانة، ما عدا صاحب البوت."""
+    if not maintenance_on():
+        return
+    user = update.effective_user
+    if user and user.id in (OWNER_ID, ADMIN_ID):
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(MAINTENANCE_TEXT, show_alert=True)
+        elif update.pre_checkout_query:
+            await update.pre_checkout_query.answer(ok=False, error_message="البوت في صيانة، حاول لاحقاً.")
+        elif update.effective_message:
+            await update.effective_message.reply_text(MAINTENANCE_TEXT)
+    except Exception as e:
+        print("MAINTENANCE GATE ERROR:", repr(e))
+    raise ApplicationHandlerStop
+
+
+async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /maintenance on | off  (للأدمن فقط)
+    if update.effective_user.id not in (OWNER_ID, ADMIN_ID):
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if arg == "on":
+        open(MAINTENANCE_FLAG, "w").close()
+        await update.message.reply_text("🛠 وضع الصيانة شغال. المستخدمين هيشوفوا رسالة الصيانة.")
+    elif arg == "off":
+        if os.path.exists(MAINTENANCE_FLAG):
+            os.remove(MAINTENANCE_FLAG)
+        await update.message.reply_text("✅ وضع الصيانة اتقفل. البوت رجع يشتغل.")
+    else:
+        state = "شغال" if maintenance_on() else "مقفول"
+        await update.message.reply_text(f"وضع الصيانة حالياً: {state}\nالاستخدام: /maintenance on أو /maintenance off")
 
 
 # =========================
@@ -838,6 +1396,7 @@ def main():
         .connect_timeout(30)
         .read_timeout(60)
         .write_timeout(60)
+        .post_init(post_init)
         .build()
     )
 
@@ -850,15 +1409,23 @@ def main():
         | filters.Document.AUDIO
     )
 
+    app.add_handler(TypeHandler(Update, maintenance_gate), group=-1)
+    app.add_handler(CommandHandler("maintenance", maintenance_cmd))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("premium", premium_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CallbackQueryHandler(check_sub, pattern=r"^check_sub$"))
     app.add_handler(CallbackQueryHandler(premium_menu, pattern=r"^premium$"))
-    app.add_handler(CallbackQueryHandler(send_premium_invoice, pattern=r"^buy_premium$"))
+    app.add_handler(CallbackQueryHandler(send_premium_invoice, pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(quality_menu, pattern=r"^choose_(video|audio)$"))
     app.add_handler(CallbackQueryHandler(locked, pattern=r"^lock$"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
     app.add_handler(CallbackQueryHandler(tts_callback, pattern=r"^tts:"))
+    app.add_handler(CallbackQueryHandler(media_callback, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(extra_callback, pattern=r"^extra:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
