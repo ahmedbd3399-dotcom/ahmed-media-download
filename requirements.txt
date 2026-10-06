@@ -1,4 +1,7 @@
-python-telegram-bot==22.8
-yt-dlp[default,curl-cffi]
+python-telegram-bot>=21
+yt-dlp
+curl_cffi
 Pillow
+python-dotenv
 imageio-ffmpeg
+edge-tts
