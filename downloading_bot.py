@@ -6,6 +6,12 @@ import asyncio
 import tempfile
 import threading
 import subprocess
+import json
+import socket
+import ipaddress
+import html as html_lib
+import urllib.request
+from urllib.parse import urlparse, urljoin, urlencode
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -464,6 +470,40 @@ FFMPEG = ffmpeg_path()
 # YT-DLP OPTIONS
 # =========================
 
+PROXY_URL = os.environ.get("YTDLP_PROXY", "").strip()  # اختياري: http://user:pass@host:port
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+             "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+
+
+def prepare_url(url):
+    """يفك روابط تيك توك المختصرة (vt/vm/tiktok.com/t) ويكشف لو تيك توك حاجب السيرفر."""
+    p = urlparse(url)
+    host = p.netloc.lower()
+    is_short = host in ("vt.tiktok.com", "vm.tiktok.com") or (
+        host.endswith("tiktok.com") and p.path.startswith("/t/")
+    )
+    if not is_short:
+        return url
+    try:
+        handlers = []
+        if PROXY_URL:
+            handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+        with opener.open(req, timeout=15) as r:
+            final = r.geturl()
+    except Exception as e:
+        print("RESOLVE ERROR:", url, repr(e))
+        return url
+    print("RESOLVED:", url, "->", final)
+    low = final.lower()
+    if "/login" in low or "captcha" in low or "/verify" in low:
+        print("TIKTOK BLOCKED THIS SERVER (login/captcha redirect)")
+        return url
+    m = re.match(r"(https?://[^?#]+/(?:video|photo)/\d+)", final)
+    return m.group(1) if m else final
+
+
 def base_opts():
     opts = {
         "quiet": True,
@@ -476,6 +516,8 @@ def base_opts():
     }
     if FFMPEG:
         opts["ffmpeg_location"] = FFMPEG
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
 
     # impersonate لازم يكون كائن مش نص (ده كان سبب الخطأ)
     try:
@@ -494,9 +536,16 @@ STANDARD = [144, 240, 360, 480, 720, 1080, 1440, 2160]
 
 
 def get_formats(url):
+    url = prepare_url(url)
     opts = {**base_opts(), "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print("YTDLP FORMATS ERROR (trying fallback):", repr(e)[:200])
+        if fallback_resolve(url):
+            return [], True   # هنحمّل بالبديل: جودة واحدة "أفضل متاحة"
+        raise
 
     if info.get("_type") == "playlist" and info.get("entries"):
         info = next((e for e in info["entries"] if e), info)
@@ -582,7 +631,198 @@ def add_watermark(video_path, out_dir, video_width):
 # DOWNLOAD
 # =========================
 
+# =========================
+# FALLBACKS (لو yt-dlp مقدرش يقرأ الرابط)
+# =========================
+
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+FB_MAX_BYTES = 250 * 1024 * 1024
+VIDEO_EXTS = r"(?:mp4|m3u8|webm|mov|m4v)"
+
+
+def _is_public_host(host):
+    """حماية: مانطلبش عناوين داخلية (localhost / شبكة السيرفر)."""
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _http_open(url, referer=None, timeout=20):
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not _is_public_host(p.hostname or ""):
+        raise ValueError("blocked url")
+    handlers = []
+    if PROXY_URL:
+        handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+    opener = urllib.request.build_opener(*handlers)
+    headers = {"User-Agent": DESKTOP_UA, "Accept": "*/*"}
+    if referer:
+        headers["Referer"] = referer
+    return opener.open(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
+def _abs(base, u):
+    u = html_lib.unescape(u.replace("\\/", "/").replace("\\u0026", "&")).strip()
+    return urljoin(base, u)
+
+
+def _scrape_video_url(url):
+    """بيدوّر في صفحة الموقع على رابط فيديو مباشر (og:video / video / source / mp4 / m3u8)."""
+    with _http_open(url) as r:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "json" not in ctype and "text" not in ctype:
+            return None
+        page = r.read(2_000_000).decode("utf-8", "ignore")
+        base = r.geturl()
+    patterns = [
+        r'<meta[^>]+(?:property|name)=["\']og:video(?::secure_url|:url)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:video(?::secure_url|:url)?["\']',
+        r'<(?:source|video)[^>]+src=["\']([^"\']+)["\']',
+        r'"contentUrl"\s*:\s*"([^"]+)"',
+        r'(https?:(?:\\?/){2}[^"\'\s<>\\]+?\.' + VIDEO_EXTS + r'(?:\?[^"\'\s<>\\]*)?)',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, page, re.IGNORECASE):
+            cand = _abs(base, m.group(1))
+            path = urlparse(cand).path.lower()
+            if re.search(r"\." + VIDEO_EXTS + r"$", path) or "og:video" in pat or "contentUrl" in pat:
+                if cand.startswith("http") and not re.search(r"\.(jpg|jpeg|png|gif|webp|svg)$", path):
+                    return cand
+    return None
+
+
+def _tikwm(url):
+    """TikTok (بما فيه السلايد شو) عن طريق خدمة tikwm."""
+    api = "https://www.tikwm.com/api/?" + urlencode({"url": url, "hd": 1})
+    with _http_open(api, timeout=25) as r:
+        data = json.loads(r.read(1_000_000).decode("utf-8", "ignore"))
+    if data.get("code") != 0 or not data.get("data"):
+        return None
+    d = data["data"]
+    base = "https://www.tikwm.com"
+    images = [_abs(base, i) for i in (d.get("images") or [])][:35]
+    video = d.get("hdplay") or d.get("play")
+    music = d.get("music")
+    if images:
+        return {"images": images, "music": _abs(base, music) if music else None}
+    if video:
+        return {"video": _abs(base, video)}
+    return None
+
+
+def fallback_resolve(url):
+    """يرجّع dict فيه video أو images(+music)، أو None."""
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.endswith("tiktok.com"):
+            res = _tikwm(url)
+            if res:
+                return res
+        v = _scrape_video_url(url)
+        if v:
+            return {"video": v}
+    except Exception as e:
+        print("FALLBACK RESOLVE ERROR:", repr(e))
+    return None
+
+
+def _fetch_direct(u, dest, referer=None):
+    """ينزّل ملف مباشر (mp4 / m3u8 ...) لمسار محلي. يرجّع المسار أو None."""
+    try:
+        if ".m3u8" in urlparse(u).path.lower():
+            if not _is_public_host(urlparse(u).hostname or ""):
+                return None
+            _ff(["-user_agent", DESKTOP_UA, "-i", u, "-c", "copy",
+                 "-bsf:a", "aac_adtstoasc", dest], timeout=900)
+        else:
+            with _http_open(u, referer=referer, timeout=30) as r:
+                total = int(r.headers.get("Content-Length") or 0)
+                if total > FB_MAX_BYTES:
+                    raise UserError("الملف كبير جداً.")
+                size = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = r.read(1024 * 256)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > FB_MAX_BYTES:
+                            raise UserError("الملف كبير جداً.")
+                        f.write(chunk)
+        return dest if os.path.exists(dest) and os.path.getsize(dest) > 0 else None
+    except UserError:
+        raise
+    except Exception as e:
+        print("FETCH DIRECT ERROR:", repr(e))
+        return None
+
+
+def slideshow_to_video(images, music, out, temp_dir):
+    """صور (+موسيقى) -> فيديو، لمنشورات الصور/السلايد."""
+    lst = os.path.join(temp_dir, "slides.txt")
+    with open(lst, "w", encoding="utf-8") as f:
+        for p in images:
+            f.write(f"file '{p}'\nduration 3\n")
+        f.write(f"file '{images[-1]}'\n")
+    vf = ("scale=720:1280:force_original_aspect_ratio=decrease,"
+          "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,fps=25")
+    args = ["-f", "concat", "-safe", "0", "-i", lst]
+    if music:
+        args += ["-stream_loop", "-1", "-i", music, "-shortest"]
+    args += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "27"]
+    if music:
+        args += ["-c:a", "aac", "-b:a", "128k"]
+    args += ["-movflags", "+faststart", out]
+    _ff(args, timeout=600)
+    return out
+
+
+def fallback_download(url, temp_dir, media_type, quality):
+    """بديل التحميل لما yt-dlp يفشل. يرجّع (مسار الملف, العرض) أو None."""
+    fb = fallback_resolve(url)
+    if not fb:
+        return None
+    referer = url
+    if fb.get("images"):
+        imgs = []
+        for i, u in enumerate(fb["images"]):
+            p = _fetch_direct(u, os.path.join(temp_dir, f"img_{i:02d}.jpg"), referer)
+            if p:
+                imgs.append(p)
+        if not imgs:
+            return None
+        music = None
+        if fb.get("music"):
+            music = _fetch_direct(fb["music"], os.path.join(temp_dir, "music.mp3"), referer)
+        if media_type == "audio":
+            if not music:
+                raise UserError("المنشور ده صور من غير موسيقى.")
+            return music if quality is None else _to_mp3_quality(music, temp_dir, quality), 720
+        vid = slideshow_to_video(imgs, music, os.path.join(temp_dir, "slideshow.mp4"), temp_dir)
+        return vid, 720
+
+    vid = _fetch_direct(fb["video"], os.path.join(temp_dir, "fb_video.mp4"), referer)
+    if not vid:
+        return None
+    if media_type == "audio":
+        return _to_mp3_quality(vid, temp_dir, quality), 720
+    return vid, 720
+
+
+def _to_mp3_quality(src, temp_dir, quality):
+    out = os.path.join(temp_dir, "fb_audio.mp3")
+    _ff(["-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", f"{quality}k", out])
+    return out
+
+
 def download_media(url, media_type, quality, premium):
+    url = prepare_url(url)
     temp_dir = tempfile.mkdtemp(prefix="amd_")
     try:
         opts = {**base_opts(), "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s")}
@@ -607,20 +847,35 @@ def download_media(url, media_type, quality, premium):
                 "merge_output_format": "mp4",
             })
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info.get("_type") == "playlist" and info.get("entries"):
-                info = next((e for e in info["entries"] if e), info)
+        ytdlp_error = None
+        info = {}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info.get("_type") == "playlist" and info.get("entries"):
+                    info = next((e for e in info["entries"] if e), info)
+        except Exception as e:
+            ytdlp_error = e
+            print("YTDLP DOWNLOAD ERROR (trying fallback):", repr(e)[:200])
 
-        files = [p for p in Path(temp_dir).glob("*") if p.is_file()]
-        if media_type == "audio":
-            files = [p for p in files if p.suffix == ".mp3"] or files
-        if not files:
-            raise UserError("لم يتم العثور على الملف بعد التحميل.")
-        filename = str(max(files, key=lambda p: p.stat().st_size))
+        if ytdlp_error is None:
+            files = [p for p in Path(temp_dir).glob("*") if p.is_file()]
+            if media_type == "audio":
+                files = [p for p in files if p.suffix == ".mp3"] or files
+            if not files:
+                raise UserError("لم يتم العثور على الملف بعد التحميل.")
+            filename = str(max(files, key=lambda p: p.stat().st_size))
+            width = info.get("width") or 720
+        else:
+            fb = fallback_download(
+                url, temp_dir, media_type, quality if media_type == "audio" else None
+            )
+            if not fb:
+                raise ytdlp_error
+            filename, width = fb
 
         if media_type == "video" and not premium:
-            filename = add_watermark(filename, temp_dir, info.get("width") or 720)
+            filename = add_watermark(filename, temp_dir, width)
 
         size = os.path.getsize(filename)
         if size > MAX_FILE_SIZE:
@@ -887,6 +1142,7 @@ def process_media(src, temp_dir, action, param, is_video):
 
 def fetch_extra(url, kind):
     """kind: thumb (صورة الغلاف) أو subs (الترجمة). يرجع (قايمة ملفات, temp_dir)"""
+    url = prepare_url(url)
     temp_dir = tempfile.mkdtemp(prefix="amx_")
     try:
         opts = {**base_opts(), "skip_download": True,
@@ -945,7 +1201,8 @@ def short_error(e):
     if "login" in low or "cookies" in low or "private" in low:
         return "الفيديو خاص أو الموقع بيطلب تسجيل دخول."
     if "unsupported url" in low:
-        return "الرابط ده مش مدعوم."
+        print("UNSUPPORTED URL ERROR:", text[:300])
+        return "معرفتش أحمّل من الرابط ده دلوقتي.\nتأكد إن الفيديو عام (مش خاص)، أو جرب رابط تاني."
     if "unavailable" in low or "removed" in low or "not found" in low:
         return "الفيديو غير متاح أو اتحذف."
     print("UNEXPECTED ERROR:", text[:300])
