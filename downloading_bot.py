@@ -7,6 +7,7 @@ import tempfile
 import threading
 import subprocess
 import json
+import time
 import socket
 import ipaddress
 import html as html_lib
@@ -62,7 +63,27 @@ if not TOKEN:
 
 OWNER_ID = 7219900342  # صاحب البوت: Premium دائم
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0) or OWNER_ID
-WATERMARK_TEXT = "@AhmedMediaDL_bot"
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "AhmedMediaDL_bot").lstrip("@")  # بيتحدّث تلقائياً من تليجرام
+WATERMARK_TEXT = "@" + BOT_USERNAME
+
+# اسم البوت (عربي) — بيظهر في الرسايل، وبيتضبط تلقائياً في تليجرام (الاسم والوصف)
+BOT_NAME = os.environ.get("BOT_NAME", "محمّل الفيديوهات")
+TG_NAME = os.environ.get("TG_NAME", "محمّل الفيديوهات | تيك توك يوتيوب انستجرام")[:64]
+TG_SHORT = os.environ.get(
+    "TG_SHORT",
+    "حمّل فيديوهات تيك توك ويوتيوب وانستجرام وفيسبوك وتويتر، وحوّلها MP3 أو حوّل النص لصوت 🎬",
+)[:120]
+TG_DESC = os.environ.get(
+    "TG_DESC",
+    "🎬 محمّل الفيديوهات\n\n"
+    "ابعت رابط الفيديو وهحمّله لك في ثواني من:\n"
+    "• تيك توك • يوتيوب • انستجرام • فيسبوك • تويتر وغيرهم\n\n"
+    "🎵 حوّل أي فيديو لـ MP3\n"
+    "✂️ قص وضغط وتعديل الصوت والفيديو\n"
+    "🔊 حوّل النص لصوت بأصوات عربية وإنجليزية\n"
+    "⭐ اشتراك Premium بجودة أعلى\n\n"
+    "اضغط «ابدأ» وابعت أول رابط 👇",
+)[:512]
 WATERMARK_LOGO = "watermark.png"   # لو حطيت اللوجو هنا هيستخدمه بدل النص
 COOKIES_FILE = "cookies.txt"       # اختياري (إنستجرام / فيسبوك)
 CHANNEL_USERNAME = "@AhmedMediaDL"  # قناة الاشتراك الإجباري
@@ -536,14 +557,15 @@ STANDARD = [144, 240, 360, 480, 720, 1080, 1440, 2160]
 
 
 def get_formats(url):
+    orig = url
+    FB_DIAG.pop(orig, None)
     url = prepare_url(url)
     opts = {**base_opts(), "skip_download": True}
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = ytdlp_run(url, opts, False, orig)
     except Exception as e:
         print("YTDLP FORMATS ERROR (trying fallback):", repr(e)[:200])
-        if fallback_resolve(url):
+        if fallback_resolve(url, orig):
             return [], True   # هنحمّل بالبديل: جودة واحدة "أفضل متاحة"
         raise
 
@@ -697,12 +719,112 @@ def _scrape_video_url(url):
     return None
 
 
-def _tikwm(url):
-    """TikTok (بما فيه السلايد شو) عن طريق خدمة tikwm."""
+# ---- تشخيص + بدائل إضافية ----
+COBALT_API_URL = os.environ.get("COBALT_API_URL", "").strip()   # اختياري: سيرفر cobalt (بتاعك أو عام)
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
+FB_DIAG = {}
+
+
+def _note(key, text):
+    """ملاحظات تشخيص بنعرضها للأدمن بس لو التحميل فشل."""
+    if not key:
+        return
+    if len(FB_DIAG) > 100:
+        FB_DIAG.pop(next(iter(FB_DIAG)))
+    FB_DIAG.setdefault(key, [])
+    if len(FB_DIAG[key]) < 12:
+        FB_DIAG[key].append(text[:240])
+    print("NOTE:", text[:240])
+
+
+def diag_notes(key):
+    return "\n".join(FB_DIAG.get(key, [])[-8:])
+
+
+def _clean_err(e):
+    return re.sub(r"\x1b\[[0-9;]*m", "", str(e)).strip()
+
+
+def _candidate_urls(url):
+    """الرابط نفسه + بدائل ليه (تيك توك: صفحة الـ embed بتشتغل أحياناً لما الصفحة العادية تتحجب)."""
+    urls = [url]
+    m = re.search(r"tiktok\.com/(?:@[\w.\-]+/)?(?:video|photo)/(\d+)", url)
+    if m:
+        urls.append(f"https://www.tiktok.com/embed/{m.group(1)}")
+    return urls
+
+
+def ytdlp_run(url, opts, download, key=None):
+    err = None
+    for u in _candidate_urls(url):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(u, download=download)
+        except Exception as e:
+            if err is None:
+                err = e
+            _note(key, f"yt-dlp ({urlparse(u).path[:30]}): {_clean_err(e)[:200]}")
+    raise err
+
+
+def _cobalt(url, key=None):
+    """بديل اختياري عن طريق سيرفر cobalt (لو COBALT_API_URL متضبط)."""
+    if not COBALT_API_URL:
+        return None
+    headers = {"Accept": "application/json", "Content-Type": "application/json",
+               "User-Agent": DESKTOP_UA}
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    body = json.dumps({"url": url, "videoQuality": "1080", "downloadMode": "auto"}).encode()
+    try:
+        req = urllib.request.Request(COBALT_API_URL, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=40) as r:
+            data = json.loads(r.read(1_000_000).decode("utf-8", "ignore"))
+    except Exception as e:
+        err_body = ""
+        if hasattr(e, "read"):
+            try:
+                err_body = e.read(300).decode("utf-8", "ignore")
+            except Exception:
+                pass
+        _note(key, f"cobalt: {type(e).__name__} {err_body[:120]}")
+        return None
+    st = data.get("status")
+    if st in ("tunnel", "redirect") and data.get("url"):
+        return {"video": data["url"]}
+    if st == "picker":
+        vids = [p["url"] for p in data.get("picker", []) if p.get("type") == "video" and p.get("url")]
+        if vids:
+            return {"video": vids[0]}
+        imgs = [p["url"] for p in data.get("picker", []) if p.get("type") == "photo" and p.get("url")]
+        if imgs:
+            return {"images": imgs[:35], "music": data.get("audio")}
+    _note(key, f"cobalt: status={st} {str(data.get('error'))[:120]}")
+    return None
+
+
+def _tikwm_raw(url):
+    """نداء tikwm (مع إعادة المحاولة لو الخدمة طلبت نستنى بين الطلبات)."""
     api = "https://www.tikwm.com/api/?" + urlencode({"url": url, "hd": 1})
-    with _http_open(api, timeout=25) as r:
-        data = json.loads(r.read(1_000_000).decode("utf-8", "ignore"))
+    data = {}
+    for _ in range(3):
+        with _http_open(api, timeout=25) as r:
+            data = json.loads(r.read(1_000_000).decode("utf-8", "ignore"))
+        if data.get("code") == 0 or "limit" not in str(data.get("msg", "")).lower():
+            break
+        time.sleep(1.5)
+    return data
+
+
+def _tikwm(url, key=None):
+    """TikTok (بما فيه السلايد شو) عن طريق خدمة tikwm."""
+    try:
+        data = _tikwm_raw(url)
+    except Exception as e:
+        _note(key, f"tikwm: {type(e).__name__}: {str(e)[:100]}")
+        return None
     if data.get("code") != 0 or not data.get("data"):
+        _note(key, f"tikwm: code={data.get('code')} msg={str(data.get('msg'))[:100]}")
         return None
     d = data["data"]
     base = "https://www.tikwm.com"
@@ -716,19 +838,27 @@ def _tikwm(url):
     return None
 
 
-def fallback_resolve(url):
+def fallback_resolve(url, key=None):
     """يرجّع dict فيه video أو images(+music)، أو None."""
+    key = key or url
     try:
         host = urlparse(url).netloc.lower()
-        if host.endswith("tiktok.com"):
-            res = _tikwm(url)
+        tries = list(dict.fromkeys([url, key]))
+        if host.endswith("tiktok.com") or urlparse(key).netloc.lower().endswith("tiktok.com"):
+            for u in tries:
+                res = _tikwm(u, key)
+                if res:
+                    return res
+        for u in tries:
+            res = _cobalt(u, key)
             if res:
                 return res
         v = _scrape_video_url(url)
         if v:
             return {"video": v}
+        _note(key, "scrape: مفيش رابط فيديو في الصفحة")
     except Exception as e:
-        print("FALLBACK RESOLVE ERROR:", repr(e))
+        _note(key, f"fallback: {type(e).__name__}: {str(e)[:100]}")
     return None
 
 
@@ -783,9 +913,9 @@ def slideshow_to_video(images, music, out, temp_dir):
     return out
 
 
-def fallback_download(url, temp_dir, media_type, quality):
+def fallback_download(url, temp_dir, media_type, quality, key=None):
     """بديل التحميل لما yt-dlp يفشل. يرجّع (مسار الملف, العرض) أو None."""
-    fb = fallback_resolve(url)
+    fb = fallback_resolve(url, key)
     if not fb:
         return None
     referer = url
@@ -821,7 +951,57 @@ def _to_mp3_quality(src, temp_dir, quality):
     return out
 
 
+def diagnose_link(url):
+    """تقرير تشخيص خطوة بخطوة لرابط (للأدمن)."""
+    out = []
+    try:
+        import yt_dlp.version as _v
+        out.append(f"yt-dlp: {_v.__version__}")
+    except Exception:
+        out.append("yt-dlp: ?")
+    for h in ("www.tiktok.com", "www.tikwm.com"):
+        try:
+            with _http_open(f"https://{h}/", timeout=10) as r:
+                out.append(f"🌐 {h}: HTTP {r.status}")
+        except Exception as e:
+            out.append(f"🌐 {h}: ❌ {type(e).__name__}: {str(e)[:80]}")
+
+    final = url
+    try:
+        final = prepare_url(url)
+        out.append(f"↪️ بعد فك الرابط: {final[:150]}")
+    except Exception as e:
+        out.append(f"↪️ فك الرابط فشل: {e}")
+
+    try:
+        with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True}) as ydl:
+            info = ydl.extract_info(final, download=False)
+        out.append(f"✅ yt-dlp قرأ الرابط: {(info.get('title') or '')[:60]} | formats={len(info.get('formats') or [])}")
+    except Exception as e:
+        out.append("❌ yt-dlp: " + re.sub(r"\x1b\[[0-9;]*m", "", str(e))[:300])
+
+    if urlparse(final).netloc.lower().endswith("tiktok.com"):
+        try:
+            raw = _tikwm_raw(final)
+            d = raw.get("data") or {}
+            out.append(
+                f"tikwm: code={raw.get('code')} msg={str(raw.get('msg'))[:80]} | "
+                f"video={'نعم' if (d.get('hdplay') or d.get('play')) else 'لا'} | صور={len(d.get('images') or [])}"
+            )
+        except Exception as e:
+            out.append(f"❌ tikwm: {type(e).__name__}: {str(e)[:100]}")
+
+    try:
+        v = _scrape_video_url(final)
+        out.append("scrape: " + (v[:120] if v else "مفيش رابط فيديو في الصفحة"))
+    except Exception as e:
+        out.append(f"❌ scrape: {type(e).__name__}: {str(e)[:100]}")
+    return "\n".join(out)
+
+
 def download_media(url, media_type, quality, premium):
+    orig = url
+    FB_DIAG.pop(orig, None)
     url = prepare_url(url)
     temp_dir = tempfile.mkdtemp(prefix="amd_")
     try:
@@ -850,10 +1030,9 @@ def download_media(url, media_type, quality, premium):
         ytdlp_error = None
         info = {}
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info.get("_type") == "playlist" and info.get("entries"):
-                    info = next((e for e in info["entries"] if e), info)
+            info = ytdlp_run(url, opts, True, orig)
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = next((e for e in info["entries"] if e), info)
         except Exception as e:
             ytdlp_error = e
             print("YTDLP DOWNLOAD ERROR (trying fallback):", repr(e)[:200])
@@ -868,7 +1047,7 @@ def download_media(url, media_type, quality, premium):
             width = info.get("width") or 720
         else:
             fb = fallback_download(
-                url, temp_dir, media_type, quality if media_type == "audio" else None
+                url, temp_dir, media_type, quality if media_type == "audio" else None, orig
             )
             if not fb:
                 raise ytdlp_error
@@ -1264,7 +1443,7 @@ async def check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 START_TEXT = (
-    "🎬 Ahmed Media Downloader\n\n"
+    "🎬 " + BOT_NAME + "\n\n"
     "اختار اللي عايزه من القايمة، أو ابعت مباشرة:\n"
     "• رابط فيديو ← أحمله لك\n"
     "• فيديو أو ملف صوت ← أدوات (MP3، فويس، قص، سرعة، ضغط...)\n"
@@ -1413,7 +1592,7 @@ async def tts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_audio(
                 audio=f,
                 title="Text to Speech",
-                caption="🔊 @AhmedMediaDL_bot",
+                caption="🔊 @" + BOT_USERNAME,
                 write_timeout=300,
                 read_timeout=300,
             )
@@ -1500,7 +1679,7 @@ async def run_media_job(status, context, user_id, action, param=None):
         title = None
         if media.get("name"):
             title = os.path.splitext(media["name"])[0][:60]
-        cap = "@AhmedMediaDL_bot"
+        cap = "@" + BOT_USERNAME
         opts = dict(write_timeout=300, read_timeout=300)
         with open(out, "rb") as f:
             if kind == "audio":
@@ -1610,14 +1789,14 @@ async def extra_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(path, "rb") as f:
                 if kind == "thumb":
                     try:
-                        await q.message.reply_photo(photo=f, caption="🖼 @AhmedMediaDL_bot",
+                        await q.message.reply_photo(photo=f, caption="🖼 @" + BOT_USERNAME,
                                                     write_timeout=120, read_timeout=120)
                     except Exception as send_error:
                         print("PHOTO SEND ERROR:", repr(send_error))
                         f.seek(0)
                         await q.message.reply_document(document=f, write_timeout=120, read_timeout=120)
                 else:
-                    await q.message.reply_document(document=f, caption="📝 @AhmedMediaDL_bot",
+                    await q.message.reply_document(document=f, caption="📝 @" + BOT_USERNAME,
                                                    write_timeout=120, read_timeout=120)
         await q.edit_message_text("✅ تم.")
     except Exception as e:
@@ -1632,7 +1811,7 @@ def premium_view(user_id):
     """نص + أزرار صفحة Premium (للأمر والزر)."""
     month_price = PLANS["m1"][1]
     lines = [
-        "⭐ Ahmed Media Downloader Premium\n",
+        "⭐ " + BOT_NAME + " Premium\n",
         "• بدون علامة مائية",
         "• جودات 1080p وأعلى",
         f"• نصوص أطول لتحويل النص لصوت (حتى {TTS_MAX_PREMIUM} حرف)",
@@ -1716,8 +1895,32 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ تم الإلغاء. ابعت رابط أو ملف أو نص عشان نبدأ من جديد.")
 
 
+async def apply_profile(bot):
+    """يضبط اسم ووصف البوت بالعربي في تليجرام (مرة واحدة لكل تغيير)."""
+    import hashlib
+    h = hashlib.md5((TG_NAME + TG_SHORT + TG_DESC).encode("utf-8")).hexdigest()
+    if get_pref(0, "profile_hash") == h:
+        return
+    try:
+        for lang in (None, "ar"):
+            kw = {"language_code": lang} if lang else {}
+            await bot.set_my_name(name=TG_NAME, **kw)
+            await bot.set_my_short_description(short_description=TG_SHORT, **kw)
+            await bot.set_my_description(description=TG_DESC, **kw)
+        set_pref(0, "profile_hash", h)
+        print("PROFILE UPDATED:", TG_NAME)
+    except Exception as e:
+        # تغيير الاسم له حد في تليجرام؛ هنحاول تاني في التشغيل الجاي
+        print("PROFILE UPDATE ERROR:", repr(e))
+
+
 async def post_init(app):
     """قايمة الاختصارات اللي بتظهر في زر (Menu) جنب خانة الكتابة."""
+    global BOT_USERNAME, WATERMARK_TEXT
+    if getattr(app.bot, "username", None):
+        BOT_USERNAME = app.bot.username
+        WATERMARK_TEXT = "@" + BOT_USERNAME
+    await apply_profile(app.bot)
     user_cmds = [
         BotCommand("start", "القائمة الرئيسية"),
         BotCommand("help", "الأوامر وشرح الاستخدام"),
@@ -1737,8 +1940,11 @@ async def post_init(app):
                 user_cmds + [
                     BotCommand("grant", "تفعيل Premium: /grant id أيام (أدمن)"),
                     BotCommand("stats", "إحصائيات البوت (أدمن)"),
+                    BotCommand("testlink", "تشخيص رابط مش بيتحمل (أدمن)"),
                     BotCommand("broadcast", "رسالة لكل المستخدمين (أدمن)"),
                     BotCommand("gencode", "إنشاء كود هدية (أدمن)"),
+                    BotCommand("dropcode", "كود هدية وينزل في الجروب (أدمن)"),
+                    BotCommand("dropchat", "تحديد جروب الأكواد (أدمن)"),
                     BotCommand("userinfo", "بيانات مستخدم (أدمن)"),
                     BotCommand("backup", "نسخة احتياطية للداتا (أدمن)"),
                     BotCommand("ban", "حظر مستخدم (أدمن)"),
@@ -1831,7 +2037,10 @@ async def quality_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("FORMAT ERROR:", repr(e))
         msg = short_error(e)
-        await q.edit_message_text(msg if msg == MAINTENANCE_TEXT else f"❌ مقدرتش أقرأ الرابط.\n\n{msg}")
+        text = msg if msg == MAINTENANCE_TEXT else f"❌ مقدرتش أقرأ الرابط.\n\n{msg}"
+        if is_admin(q.from_user.id) and diag_notes(url):
+            text += "\n\n🔧 تشخيص (ظاهر للأدمن بس):\n" + diag_notes(url)
+        await q.edit_message_text(text[:3800])
         return
 
     premium = is_premium(q.from_user.id)
@@ -1896,7 +2105,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 download_media, url, media_type, quality, premium
             )
 
-        caption = "🎬 @AhmedMediaDL_bot"
+        caption = "🎬 @" + BOT_USERNAME
         with open(filename, "rb") as f:
             if media_type == "audio":
                 await q.message.reply_audio(
@@ -1921,7 +2130,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("DOWNLOAD ERROR:", repr(e))
         msg = short_error(e)
-        await q.edit_message_text(msg if msg == MAINTENANCE_TEXT else f"❌ حصل خطأ أثناء التحميل.\n\n{msg}")
+        text = msg if msg == MAINTENANCE_TEXT else f"❌ حصل خطأ أثناء التحميل.\n\n{msg}"
+        if is_admin(q.from_user.id) and diag_notes(url):
+            text += "\n\n🔧 تشخيص (ظاهر للأدمن بس):\n" + diag_notes(url)
+        await q.edit_message_text(text[:3800])
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1931,6 +2143,10 @@ async def error_handler(update, context):
     print("BOT ERROR:", repr(context.error))
     # أخطاء الشبكة المؤقتة: متبعتش رسالة صيانة
     if isinstance(context.error, (NetworkError, TimedOut)):
+        return
+    # مانبعتش رسالة صيانة إلا في الشات الخاص (مش في القنوات/الجروبات)
+    chat = update.effective_chat if isinstance(update, Update) else None
+    if not chat or chat.type != "private":
         return
     try:
         if isinstance(update, Update):
@@ -1991,6 +2207,19 @@ REF_RE = re.compile(r"^/start(?:@\w+)?\s+ref_(\d+)")
 
 async def track_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يسجّل كل مستخدم، ويمنع المحظورين."""
+    # البوت بيشتغل في الشات الخاص بس: نتجاهل القنوات والجروبات بدون أي رد
+    chat = update.effective_chat
+    if update.channel_post or update.edited_channel_post or (chat and chat.type != "private"):
+        # استثناء: الأدمن يكتب /chatid في الجروب ياخد رقمه (محتاجه لـ /dropchat)
+        m = update.effective_message
+        u = update.effective_user
+        if (m and u and is_admin(u.id) and chat
+                and (getattr(m, "text", None) or "").split("@")[0].strip() == "/chatid"):
+            try:
+                await m.reply_text(f"🆔 رقم الشات: {chat.id}")
+            except Exception as e:
+                print("CHATID ERROR:", repr(e))
+        raise ApplicationHandlerStop
     user = update.effective_user
     if not user or user.is_bot:
         return
@@ -2073,6 +2302,106 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("FEEDBACK ERROR:", repr(e))
         await update.message.reply_text("❌ معرفتش أوصّل الرسالة دلوقتي، جرب بعدين.")
+
+
+def drop_chat_id():
+    v = get_pref(0, "drop_chat") or os.environ.get("DROP_CHAT_ID", "").strip()
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def drop_message(code, days, uses, username):
+    link = f"https://t.me/{username}"
+    text = (
+        "🎁 <b>هدية Premium!</b>\n\n"
+        f"⭐ <b>{days} يوم Premium</b> — لأول <b>{uses}</b> "
+        + ("شخص" if uses == 1 else "أشخاص") + " بس!\n\n"
+        "📋 اضغط على الأمر ده ينتسخ لوحده:\n"
+        f"<code>/redeem {code}</code>\n\n"
+        f"وابعته للبوت في الخاص 👉 @{username}\n\n"
+        "⚡ الأسرع ياخدها!"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤖 افتح البوت", url=link)]])
+    return text, kb
+
+
+async def dropchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dropchat <رقم الجروب> — الجروب اللي هتتنزل فيه الأكواد."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        cur = drop_chat_id()
+        await update.message.reply_text(
+            f"الجروب الحالي: {cur if cur else 'غير محدد'}\n\n"
+            "عشان تحدده: ضيف البوت للجروب (يفضل أدمن)، واكتب في الجروب /chatid ياخد رقمه، "
+            "وبعدين هنا: /dropchat <الرقم>"
+        )
+        return
+    try:
+        cid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("الرقم غير صحيح. مثال: /dropchat -1001234567890")
+        return
+    try:
+        chat = await context.bot.get_chat(cid)
+    except Exception as e:
+        await update.message.reply_text(f"❌ مقدرتش أوصل للشات ده: {e}\nتأكد إن البوت مضاف فيه.")
+        return
+    set_pref(0, "drop_chat", cid)
+    await update.message.reply_text(f"✅ تم. الأكواد هتتنزل في: {chat.title or cid}")
+
+
+async def dropcode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dropcode <أيام> [عدد الأشخاص] — يعمل كود وينزّله في الجروب برسالة جاهزة."""
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        days = int(context.args[0])
+        uses = int(context.args[1]) if len(context.args) > 1 else 1
+        if days < 1 or uses < 1 or days > 3650 or uses > 10000:
+            raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "الاستخدام: /dropcode <الأيام> [عدد الأشخاص]\nمثال: /dropcode 1 5"
+        )
+        return
+    code = make_code(days, uses)
+    text, kb = drop_message(code, days, uses, context.bot.username)
+    cid = drop_chat_id()
+    if not cid:
+        await update.message.reply_text(
+            f"🎟 الكود: {code}\n(مفيش جروب محدد لسه، حدده بـ /dropchat وانسخ الرسالة دي مؤقتاً)\n\n"
+            + re.sub(r"<[^>]+>", "", text)
+        )
+        return
+    try:
+        await context.bot.send_message(
+            cid, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True
+        )
+        await update.message.reply_text(f"✅ اتنزل الكود {code} في الجروب ({days} يوم — {uses} أشخاص).")
+    except Exception as e:
+        print("DROPCODE ERROR:", repr(e))
+        await update.message.reply_text(
+            f"❌ معرفتش أنزّل في الجروب: {e}\n\n🎟 الكود اتعمل: {code}\n\n" + re.sub(r"<[^>]+>", "", text)
+        )
+
+
+async def testlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/testlink <رابط> — تشخيص ليه رابط مش بيتحمل (للأدمن)."""
+    if not is_admin(update.effective_user.id):
+        return
+    m = URL_RE.search(" ".join(context.args or []))
+    if not m:
+        await update.message.reply_text("الاستخدام: /testlink <الرابط>")
+        return
+    status = await update.message.reply_text("🔎 جاري التشخيص...")
+    try:
+        text = await asyncio.to_thread(diagnose_link, m.group(0))
+    except Exception as e:
+        text = f"فشل التشخيص: {e}"
+    await status.edit_text(text[:3800], disable_web_page_preview=True)
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2406,81 +2735,4 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         print("BACKUP ERROR:", repr(e))
-        await update.message.reply_text(f"❌ فشل النسخ: {e}")
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-# =========================
-# MAIN
-# =========================
-
-def main():
-    start_keep_alive()
-
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .connect_timeout(30)
-        .read_timeout(60)
-        .write_timeout(60)
-        .post_init(post_init)
-        .build()
-    )
-
-    media_filter = (
-        filters.VIDEO
-        | filters.AUDIO
-        | filters.VOICE
-        | filters.VIDEO_NOTE
-        | filters.Document.VIDEO
-        | filters.Document.AUDIO
-    )
-
-    app.add_handler(TypeHandler(Update, track_gate), group=-2)
-    app.add_handler(TypeHandler(Update, maintenance_gate), group=-1)
-    app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("redeem", redeem_cmd))
-    app.add_handler(CommandHandler("gencode", gencode_cmd))
-    app.add_handler(CommandHandler("userinfo", userinfo_cmd))
-    app.add_handler(CommandHandler("backup", backup_cmd))
-    app.add_handler(CommandHandler("invite", invite_cmd))
-    app.add_handler(CommandHandler("feedback", feedback_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("ban", ban_cmd))
-    app.add_handler(CommandHandler("unban", unban_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("broadcast_ok", broadcast_ok_cmd))
-    app.add_handler(CommandHandler("maintenance", maintenance_cmd))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("premium", premium_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CallbackQueryHandler(check_sub, pattern=r"^check_sub$"))
-    app.add_handler(CallbackQueryHandler(premium_menu, pattern=r"^premium$"))
-    app.add_handler(CallbackQueryHandler(send_premium_invoice, pattern=r"^buy:"))
-    app.add_handler(CallbackQueryHandler(quality_menu, pattern=r"^choose_(video|audio)$"))
-    app.add_handler(CallbackQueryHandler(locked, pattern=r"^lock$"))
-    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
-    app.add_handler(CallbackQueryHandler(tts_callback, pattern=r"^tts:"))
-    app.add_handler(CallbackQueryHandler(media_callback, pattern=r"^m:"))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^set:"))
-    app.add_handler(CallbackQueryHandler(extra_callback, pattern=r"^extra:"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(media_filter, handle_file_to_mp3))
-    app.add_handler(MessageHandler(filters.Document.TEXT, handle_text_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-
-    print("FFmpeg:", FFMPEG)
-    print("Ahmed Media Downloader is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        await upda
