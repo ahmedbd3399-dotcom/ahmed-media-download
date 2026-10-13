@@ -1,0 +1,8 @@
+.env
+users.db
+users.db-wal
+users.db-shm
+cookies.txt
+maintenance.flag
+__pycache__/
+*.pyc

@@ -1,0 +1,7 @@
+python-telegram-bot==22.8
+yt-dlp[default,curl-cffi]
+Pillow
+imageio-ffmpeg
+python-dotenv
+edge-tts
+requests
